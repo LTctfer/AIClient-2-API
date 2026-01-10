@@ -215,82 +215,308 @@ export async function handleUnifiedResponse(res, responsePayload, isStream) {
     }
 }
 
-export async function handleStreamRequest(res, service, model, requestBody, fromProvider, toProvider, PROMPT_LOG_MODE, PROMPT_LOG_FILENAME, providerPoolManager, pooluuid, customName) {
+export async function handleStreamRequest(res, service, model, requestBody, fromProvider, toProvider, PROMPT_LOG_MODE, PROMPT_LOG_FILENAME, providerPoolManager, pooluuid, customName, requestConfig) {
     let fullResponseText = '';
     let fullResponseJson = '';
     let fullOldResponseJson = '';
     let responseClosed = false;
 
-    await handleUnifiedResponse(res, '', true);
-
     // fs.writeFile('request'+Date.now()+'.json', JSON.stringify(requestBody));
     // The service returns a stream in its native format (toProvider).
-    const needsConversion = getProtocolPrefix(fromProvider) !== getProtocolPrefix(toProvider);
-    requestBody.model = model;
-    const nativeStream = await service.generateContentStream(model, requestBody);
     const addEvent = getProtocolPrefix(fromProvider) === MODEL_PROTOCOL_PREFIX.CLAUDE || getProtocolPrefix(fromProvider) === MODEL_PROTOCOL_PREFIX.OPENAI_RESPONSES;
     const openStop = getProtocolPrefix(fromProvider) === MODEL_PROTOCOL_PREFIX.OPENAI ;
 
+    const getHttpStatus = (error) => {
+        const status = error?.response?.status ?? error?.statusCode ?? error?.status;
+        return typeof status === 'number' ? status : null;
+    };
+    const is5xx = (status) => typeof status === 'number' && status >= 500 && status < 600;
+    // 确定性节点失败：只有认证/权限类错误（401/403）才是节点配置问题
+    // 400 Bad Request 可能是请求格式问题，404 可能是模型不存在，都不应标记节点不健康
+    const isDeterministicFailure = (status) =>
+        status === 401 || status === 403;
+    const isTransientFailure = (error, status) =>
+        status === 429 || isRetryableNetworkError(error);
+
+    const maxRetries = Number(requestConfig?.REQUEST_MAX_RETRIES ?? 3);
+    const baseDelay = Number(requestConfig?.REQUEST_BASE_DELAY ?? 1000);
+    const maxDelay = Number(requestConfig?.REQUEST_MAX_DELAY ?? 10_000);
+
+    /**
+     * 计算退避延迟：优先使用 Retry-After 头，否则使用指数退避
+     * @param {number} attempt - 当前重试次数
+     * @param {Error} error - 错误对象（可能包含 Retry-After 头）
+     * @returns {number} 延迟毫秒数
+     */
+    const getBackoffDelay = (attempt, error = null) => {
+        // 优先使用 Retry-After 头
+        const retryAfterHeader = error?.response?.headers?.['retry-after'];
+        if (retryAfterHeader) {
+            // Retry-After 可以是秒数或 HTTP 日期
+            const parsed = parseInt(retryAfterHeader, 10);
+            if (!isNaN(parsed) && parsed > 0) {
+                const delayMs = parsed * 1000;
+                console.log(`[Retry] Using Retry-After header: ${parsed}s`);
+                return Math.min(delayMs, maxDelay);
+            }
+            // 尝试解析为 HTTP 日期
+            const dateMs = Date.parse(retryAfterHeader);
+            if (!isNaN(dateMs)) {
+                const delayMs = Math.max(0, dateMs - Date.now());
+                console.log(`[Retry] Using Retry-After date header: ${retryAfterHeader}`);
+                return Math.min(delayMs, maxDelay);
+            }
+        }
+        // 回退到指数退避
+        const raw = baseDelay * Math.pow(2, attempt);
+        return Math.max(0, Math.min(maxDelay, raw));
+    };
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    const canFastFailover = (status) =>
+        (is5xx(status) || isDeterministicFailure(status)) &&
+        Boolean(providerPoolManager) &&
+        Boolean(pooluuid) &&
+        Boolean(requestConfig?.providerPools) &&
+        Boolean(requestConfig?.MODEL_PROVIDER) &&
+        Array.isArray(requestConfig.providerPools[requestConfig.MODEL_PROVIDER]);
+
+    // 先拿到首个 chunk 再写响应头：避免上游在首包前 5xx 时无法切换 fallback
+    let effectiveService = service;
+    let effectiveProvider = toProvider;
+    let effectiveUuid = pooluuid;
+    let effectiveCustomName = customName;
+    let effectiveModel = model;
+    let effectiveRequestBody = requestBody;
+    let needsConversion = getProtocolPrefix(fromProvider) !== getProtocolPrefix(effectiveProvider);
+ 
+    const prefetchFirstChunk = async (svc, provider, mdl, body) => {
+        body.model = mdl;
+        const stream = await svc.generateContentStream(mdl, body);
+        const iterator = stream[Symbol.asyncIterator]();
+        const first = await iterator.next(); // 触发真正的上游请求
+        if (!first || first.done) {
+            throw new Error('Upstream stream ended before first chunk');
+        }
+        return { iterator, firstChunk: first.value };
+    };
+
+    // 调度层重试：仅对 429 / 网络抖动做指数退避重试，不改变号池健康状态
+    const prefetchFirstChunkWithRetry = async (svc, provider, mdl, body) => {
+        for (let attempt = 0; attempt <= maxRetries; attempt++) {
+            try {
+                return await prefetchFirstChunk(svc, provider, mdl, body);
+            } catch (error) {
+                const status = getHttpStatus(error);
+                if (isTransientFailure(error, status) && attempt < maxRetries) {
+                    const delay = getBackoffDelay(attempt, error);
+                    const tag = status ?? error?.code ?? 'TRANSIENT';
+                    console.log(`[Retry] 流式首包前检测到瞬时错误(${tag})，${delay}ms 后重试... (attempt ${attempt + 1}/${maxRetries})`);
+                    await sleep(delay);
+                    continue;
+                }
+                throw error;
+            }
+        }
+        // 理论上不可达
+        throw new Error('Prefetch retry loop exhausted unexpectedly');
+    };
+
+    let iterator = null;
+    let firstChunk = null;
+
     try {
-        for await (const nativeChunk of nativeStream) {
-            // Extract text for logging purposes
-            const chunkText = extractResponseText(nativeChunk, toProvider);
+        // 第一次尝试（当前选中的节点）
+        try {
+            const first = await prefetchFirstChunkWithRetry(effectiveService, effectiveProvider, effectiveModel, effectiveRequestBody);
+            iterator = first.iterator;
+            firstChunk = first.firstChunk;
+        } catch (error) {
+            const status = getHttpStatus(error);
+
+            // 仅在首包前的 5xx / 确定性失败 才尝试快速 failover（避免重复发送同一个必然失败的 payload）
+            if (canFastFailover(status)) {
+                const kind = is5xx(status) ? '5xx' : '确定性失败';
+                console.log(`[Provider Pool] 检测到流式首包前 ${status} (${kind})，立即熔断并尝试 failover: ${effectiveProvider} (${pooluuid})`);
+
+                if (is5xx(status)) {
+                    if (typeof providerPoolManager.markProviderServerError === 'function') {
+                        providerPoolManager.markProviderServerError(effectiveProvider, { uuid: pooluuid }, error.message);
+                    } else if (typeof providerPoolManager.markProviderUnhealthyImmediate === 'function') {
+                        providerPoolManager.markProviderUnhealthyImmediate(effectiveProvider, { uuid: pooluuid }, error.message);
+                    } else {
+                        providerPoolManager.markProviderUnhealthy(effectiveProvider, { uuid: pooluuid }, error.message);
+                    }
+                } else {
+                    if (typeof providerPoolManager.markProviderDeterministicFailure === 'function') {
+                        providerPoolManager.markProviderDeterministicFailure(effectiveProvider, { uuid: pooluuid }, error.message);
+                    } else if (typeof providerPoolManager.markProviderUnhealthyImmediate === 'function') {
+                        providerPoolManager.markProviderUnhealthyImmediate(effectiveProvider, { uuid: pooluuid }, error.message);
+                    } else {
+                        providerPoolManager.markProviderUnhealthy(effectiveProvider, { uuid: pooluuid }, error.message);
+                    }
+                }
+
+                // 尝试重新选择服务（支持 providerFallbackChain/modelFallbackMapping）
+                try {
+                    const { getApiServiceWithFallback } = await import('./service-manager.js');
+                    const result = await getApiServiceWithFallback(requestConfig, effectiveModel);
+
+                    if (result?.service) {
+                        const previousProvider = effectiveProvider;
+                        effectiveService = result.service;
+                        effectiveProvider = result.actualProviderType || effectiveProvider;
+                        effectiveUuid = result.uuid || effectiveUuid;
+                        effectiveCustomName = result.serviceConfig?.customName || effectiveCustomName;
+                        if (result.actualModel && result.actualModel !== effectiveModel) {
+                            console.log(`[Content Generation] Model Fallback: ${effectiveModel} -> ${result.actualModel}`);
+                            effectiveModel = result.actualModel;
+                        }
+
+                        // 若 fallback 导致 backend 协议变化，需要对 requestBody 做二次转换
+                        if (getProtocolPrefix(previousProvider) !== getProtocolPrefix(effectiveProvider)) {
+                            console.log(`[Request Convert] Fallback 触发，二次转换请求: ${previousProvider} -> ${effectiveProvider}`);
+                            try {
+                                effectiveRequestBody = convertData(effectiveRequestBody, 'request', previousProvider, effectiveProvider);
+                            } catch (convertError) {
+                                console.error(`[Request Convert] 二次转换失败: ${convertError.message}`);
+                                // 视为确定性失败：避免该节点被反复选中
+                                if (typeof providerPoolManager.markProviderDeterministicFailure === 'function') {
+                                    providerPoolManager.markProviderDeterministicFailure(effectiveProvider, { uuid: effectiveUuid }, `Request convert failed: ${convertError.message}`);
+                                } else if (typeof providerPoolManager.markProviderUnhealthyImmediate === 'function') {
+                                    providerPoolManager.markProviderUnhealthyImmediate(effectiveProvider, { uuid: effectiveUuid }, `Request convert failed: ${convertError.message}`);
+                                }
+                                throw convertError;
+                            }
+                        }
+                        needsConversion = getProtocolPrefix(fromProvider) !== getProtocolPrefix(effectiveProvider);
+
+                        const retryFirst = await prefetchFirstChunkWithRetry(effectiveService, effectiveProvider, effectiveModel, effectiveRequestBody);
+                        iterator = retryFirst.iterator;
+                        firstChunk = retryFirst.firstChunk;
+                    } else {
+                        throw error;
+                    }
+                } catch (failoverError) {
+                    throw failoverError;
+                }
+            } else {
+                throw error;
+            }
+        }
+
+        await handleUnifiedResponse(res, '', true);
+
+        // 标记是否已发送首包后的数据（用于区分首包前/后错误的处理策略）
+        let hasStartedStreaming = false;
+
+        // 先发送已预取的首个 chunk
+        const processNativeChunk = (nativeChunk) => {
+            const chunkText = extractResponseText(nativeChunk, effectiveProvider);
             if (chunkText && !Array.isArray(chunkText)) {
                 fullResponseText += chunkText;
             }
 
-            // Convert the complete chunk object to the client's format (fromProvider), if necessary.
             const chunkToSend = needsConversion
-                ? convertData(nativeChunk, 'streamChunk', toProvider, fromProvider, model)
+                ? convertData(nativeChunk, 'streamChunk', effectiveProvider, fromProvider, effectiveModel)
                 : nativeChunk;
 
             if (!chunkToSend) {
-                continue;
+                return;
             }
 
-            // 处理 chunkToSend 可能是数组或对象的情况
             const chunksToSend = Array.isArray(chunkToSend) ? chunkToSend : [chunkToSend];
-
             for (const chunk of chunksToSend) {
                 if (addEvent) {
-                    // fullOldResponseJson += chunk.type+"\n";
-                    // fullResponseJson += chunk.type+"\n";
                     res.write(`event: ${chunk.type}\n`);
-                    // console.log(`event: ${chunk.type}\n`);
                 }
-
-                // fullOldResponseJson += JSON.stringify(chunk)+"\n";
-                // fullResponseJson += JSON.stringify(chunk)+"\n\n";
                 res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-                // console.log(`data: ${JSON.stringify(chunk)}\n`);
             }
+            hasStartedStreaming = true;
+        };
+
+        processNativeChunk(firstChunk);
+
+        // 继续发送剩余 chunk
+        try {
+            while (true) {
+                const next = await iterator.next();
+                if (next.done) break;
+                processNativeChunk(next.value);
+            }
+        } catch (midStreamError) {
+            // 首包后错误：已经向客户端发送了部分数据，不能 failover
+            // 只记录错误并标记节点状态，然后发送错误事件结束流
+            console.error('\n[Server] Error during mid-stream processing (after first chunk):', midStreamError.message);
+
+            if (providerPoolManager && effectiveUuid) {
+                const status = getHttpStatus(midStreamError);
+                // 首包后错误使用较轻的惩罚策略：只增加错误计数，不立即熔断
+                // 因为可能是网络抖动等临时问题，而非节点本身的问题
+                console.log(`[Provider Pool] Mid-stream error (${status ?? midStreamError?.code ?? 'UNKNOWN'}), incrementing error count for: ${effectiveProvider} (${effectiveUuid})`);
+                providerPoolManager.markProviderUnhealthy(effectiveProvider, { uuid: effectiveUuid }, `Mid-stream error: ${midStreamError.message}`);
+            }
+
+            // 发送错误事件结束流
+            const errorPayload = createStreamErrorResponse(midStreamError, fromProvider);
+            res.write(errorPayload);
+            res.end();
+            responseClosed = true;
+            return; // 提前返回，跳过成功处理逻辑
         }
+
         if (openStop && needsConversion) {
-            res.write(`data: ${JSON.stringify(getOpenAIStreamChunkStop(model))}\n\n`);
+            res.write(`data: ${JSON.stringify(getOpenAIStreamChunkStop(effectiveModel))}\n\n`);
             // console.log(`data: ${JSON.stringify(getOpenAIStreamChunkStop(model))}\n`);
         }
 
         // 流式请求成功完成，统计使用次数，错误次数重置为0
-        if (providerPoolManager && pooluuid) {
-            const customNameDisplay = customName ? `, ${customName}` : '';
-            console.log(`[Provider Pool] Increasing usage count for ${toProvider} (${pooluuid}${customNameDisplay}) after successful stream request`);
-            providerPoolManager.markProviderHealthy(toProvider, {
-                uuid: pooluuid
+        if (providerPoolManager && effectiveUuid) {
+            const customNameDisplay = effectiveCustomName ? `, ${effectiveCustomName}` : '';
+            console.log(`[Provider Pool] Increasing usage count for ${effectiveProvider} (${effectiveUuid}${customNameDisplay}) after successful stream request`);
+            providerPoolManager.markProviderHealthy(effectiveProvider, {
+                uuid: effectiveUuid
             });
         }
 
     }  catch (error) {
         console.error('\n[Server] Error during stream processing:', error.stack);
-        if (providerPoolManager && pooluuid) {
-            console.log(`[Provider Pool] Marking ${toProvider} as unhealthy due to stream error`);
-            // 如果是号池模式，并且请求处理失败，则标记当前使用的提供者为不健康
-            providerPoolManager.markProviderUnhealthy(toProvider, {
-                uuid: pooluuid
-            });
+        if (providerPoolManager && effectiveUuid) {
+            const status = getHttpStatus(error);
+
+            // 号池健康模型：瞬时错误（429/网络）只退避，不直接判死；确定性失败与 5xx 才熔断
+            if (isTransientFailure(error, status)) {
+                console.log(`[Provider Pool] 流式错误(${status ?? error?.code ?? 'TRANSIENT'})判定为瞬时错误，不标记节点不健康: ${effectiveProvider} (${effectiveUuid})`);
+            } else if (is5xx(status)) {
+                console.log(`[Provider Pool] Marking ${effectiveProvider} as unhealthy due to 5xx stream error`);
+                if (typeof providerPoolManager.markProviderServerError === 'function') {
+                    providerPoolManager.markProviderServerError(effectiveProvider, { uuid: effectiveUuid }, error.message);
+                } else if (typeof providerPoolManager.markProviderUnhealthyImmediate === 'function') {
+                    providerPoolManager.markProviderUnhealthyImmediate(effectiveProvider, { uuid: effectiveUuid }, error.message);
+                } else {
+                    providerPoolManager.markProviderUnhealthy(effectiveProvider, { uuid: effectiveUuid }, error.message);
+                }
+            } else if (isDeterministicFailure(status)) {
+                console.log(`[Provider Pool] Marking ${effectiveProvider} as unhealthy due to deterministic stream error (${status})`);
+                if (typeof providerPoolManager.markProviderDeterministicFailure === 'function') {
+                    providerPoolManager.markProviderDeterministicFailure(effectiveProvider, { uuid: effectiveUuid }, error.message);
+                } else if (typeof providerPoolManager.markProviderUnhealthyImmediate === 'function') {
+                    providerPoolManager.markProviderUnhealthyImmediate(effectiveProvider, { uuid: effectiveUuid }, error.message);
+                } else {
+                    providerPoolManager.markProviderUnhealthy(effectiveProvider, { uuid: effectiveUuid }, error.message);
+                }
+            } else {
+                console.log(`[Provider Pool] Marking ${effectiveProvider} as unhealthy due to stream error`);
+                providerPoolManager.markProviderUnhealthy(effectiveProvider, { uuid: effectiveUuid }, error.message);
+            }
         }
 
         // 使用新方法创建符合 fromProvider 格式的流式错误响应
         const errorPayload = createStreamErrorResponse(error, fromProvider);
+        // 可能尚未写入响应头（首包前失败），确保 SSE 头存在
+        if (!res.headersSent) {
+            await handleUnifiedResponse(res, '', true);
+        }
         res.write(errorPayload);
         res.end();
         responseClosed = true;
@@ -305,46 +531,222 @@ export async function handleStreamRequest(res, service, model, requestBody, from
 }
 
 
-export async function handleUnaryRequest(res, service, model, requestBody, fromProvider, toProvider, PROMPT_LOG_MODE, PROMPT_LOG_FILENAME, providerPoolManager, pooluuid, customName) {
-    try{
-        // The service returns the response in its native format (toProvider).
-        const needsConversion = getProtocolPrefix(fromProvider) !== getProtocolPrefix(toProvider);
-        requestBody.model = model;
-        // fs.writeFile('oldRequest'+Date.now()+'.json', JSON.stringify(requestBody));
-        const nativeResponse = await service.generateContent(model, requestBody);
-        const responseText = extractResponseText(nativeResponse, toProvider);
+export async function handleUnaryRequest(res, service, model, requestBody, fromProvider, toProvider, PROMPT_LOG_MODE, PROMPT_LOG_FILENAME, providerPoolManager, pooluuid, customName, requestConfig) {
+    const getHttpStatus = (error) => {
+        const status = error?.response?.status ?? error?.statusCode ?? error?.status;
+        return typeof status === 'number' ? status : null;
+    };
+    const is5xx = (status) => typeof status === 'number' && status >= 500 && status < 600;
+    // 确定性节点失败：只有认证/权限类错误（401/403）才是节点配置问题
+    // 400 Bad Request 可能是请求格式问题，404 可能是模型不存在，都不应标记节点不健康
+    const isDeterministicFailure = (status) =>
+        status === 401 || status === 403;
+    const isTransientFailure = (error, status) =>
+        status === 429 || isRetryableNetworkError(error);
 
-        // Convert the response back to the client's format (fromProvider), if necessary.
+    const maxRetries = Number(requestConfig?.REQUEST_MAX_RETRIES ?? 3);
+    const baseDelay = Number(requestConfig?.REQUEST_BASE_DELAY ?? 1000);
+    const maxDelay = Number(requestConfig?.REQUEST_MAX_DELAY ?? 10_000);
+
+    /**
+     * 计算退避延迟：优先使用 Retry-After 头，否则使用指数退避
+     * @param {number} attempt - 当前重试次数
+     * @param {Error} error - 错误对象（可能包含 Retry-After 头）
+     * @returns {number} 延迟毫秒数
+     */
+    const getBackoffDelay = (attempt, error = null) => {
+        // 优先使用 Retry-After 头
+        const retryAfterHeader = error?.response?.headers?.['retry-after'];
+        if (retryAfterHeader) {
+            // Retry-After 可以是秒数或 HTTP 日期
+            const parsed = parseInt(retryAfterHeader, 10);
+            if (!isNaN(parsed) && parsed > 0) {
+                const delayMs = parsed * 1000;
+                console.log(`[Retry] Using Retry-After header: ${parsed}s`);
+                return Math.min(delayMs, maxDelay);
+            }
+            // 尝试解析为 HTTP 日期
+            const dateMs = Date.parse(retryAfterHeader);
+            if (!isNaN(dateMs)) {
+                const delayMs = Math.max(0, dateMs - Date.now());
+                console.log(`[Retry] Using Retry-After date header: ${retryAfterHeader}`);
+                return Math.min(delayMs, maxDelay);
+            }
+        }
+        // 回退到指数退避
+        const raw = baseDelay * Math.pow(2, attempt);
+        return Math.max(0, Math.min(maxDelay, raw));
+    };
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    const canFastFailover = (status) =>
+        (is5xx(status) || isDeterministicFailure(status)) &&
+        Boolean(providerPoolManager) &&
+        Boolean(pooluuid) &&
+        Boolean(requestConfig?.providerPools) &&
+        Boolean(requestConfig?.MODEL_PROVIDER) &&
+        Array.isArray(requestConfig.providerPools[requestConfig.MODEL_PROVIDER]);
+
+    // 允许在一次请求内进行一次性 failover（避免无上限重试/切换）
+    let effectiveService = service;
+    let effectiveProvider = toProvider;
+    let effectiveUuid = pooluuid;
+    let effectiveCustomName = customName;
+    let effectiveModel = model;
+    let effectiveRequestBody = requestBody;
+
+    // 调度层重试：仅对 429 / 网络抖动做指数退避重试，不改变号池健康状态
+    const generateContentWithRetry = async (svc, provider, uuid, mdl, body) => {
+        for (let attempt = 0; attempt <= maxRetries; attempt++) {
+            try {
+                body.model = mdl;
+                return await svc.generateContent(mdl, body);
+            } catch (error) {
+                const status = getHttpStatus(error);
+                if (isTransientFailure(error, status) && attempt < maxRetries) {
+                    const delay = getBackoffDelay(attempt, error);
+                    const tag = status ?? error?.code ?? 'TRANSIENT';
+                    console.log(`[Retry] 一元请求检测到瞬时错误(${tag})，${delay}ms 后重试... (attempt ${attempt + 1}/${maxRetries}) ${provider} (${uuid})`);
+                    await sleep(delay);
+                    continue;
+                }
+                throw error;
+            }
+        }
+        // 理论上不可达
+        throw new Error('Unary retry loop exhausted unexpectedly');
+    };
+
+    try{
+        const needsConversion = getProtocolPrefix(fromProvider) !== getProtocolPrefix(effectiveProvider);
+        const nativeResponse = await generateContentWithRetry(effectiveService, effectiveProvider, effectiveUuid, effectiveModel, effectiveRequestBody);
+        const responseText = extractResponseText(nativeResponse, effectiveProvider);
+
         let clientResponse = nativeResponse;
         if (needsConversion) {
-            console.log(`[Response Convert] Converting response from ${toProvider} to ${fromProvider}`);
-            clientResponse = convertData(nativeResponse, 'response', toProvider, fromProvider, model);
+            console.log(`[Response Convert] Converting response from ${effectiveProvider} to ${fromProvider}`);
+            clientResponse = convertData(nativeResponse, 'response', effectiveProvider, fromProvider, effectiveModel);
         }
 
-        //console.log(`[Response] Sending response to client: ${JSON.stringify(clientResponse)}`);
         await handleUnifiedResponse(res, JSON.stringify(clientResponse), false);
         await logConversation('output', responseText, PROMPT_LOG_MODE, PROMPT_LOG_FILENAME);
-        // fs.writeFile('oldResponse'+Date.now()+'.json', JSON.stringify(clientResponse));
         
-        // 一元请求成功完成，统计使用次数，错误次数重置为0
-        if (providerPoolManager && pooluuid) {
-            const customNameDisplay = customName ? `, ${customName}` : '';
-            console.log(`[Provider Pool] Increasing usage count for ${toProvider} (${pooluuid}${customNameDisplay}) after successful unary request`);
-            providerPoolManager.markProviderHealthy(toProvider, {
-                uuid: pooluuid
-            });
+        if (providerPoolManager && effectiveUuid) {
+            const customNameDisplay = effectiveCustomName ? `, ${effectiveCustomName}` : '';
+            console.log(`[Provider Pool] Increasing usage count for ${effectiveProvider} (${effectiveUuid}${customNameDisplay}) after successful unary request`);
+            providerPoolManager.markProviderHealthy(effectiveProvider, { uuid: effectiveUuid });
         }
     } catch (error) {
-        console.error('\n[Server] Error during unary processing:', error.stack);
-        if (providerPoolManager && pooluuid) {
-            console.log(`[Provider Pool] Marking ${toProvider} as unhealthy due to stream error`);
-            // 如果是号池模式，并且请求处理失败，则标记当前使用的提供者为不健康
-            providerPoolManager.markProviderUnhealthy(toProvider, {
-                uuid: pooluuid
-            });
+        const status = getHttpStatus(error);
+
+        // 确定性失败 / 5xx：立即熔断并尝试在同一次请求内 failover 重试一次
+        if (canFastFailover(status)) {
+            const kind = is5xx(status) ? '5xx' : '确定性失败';
+            console.log(`[Provider Pool] 检测到一元请求 ${status} (${kind})，立即熔断并尝试 failover: ${effectiveProvider} (${effectiveUuid})`);
+
+            if (is5xx(status)) {
+                if (typeof providerPoolManager.markProviderServerError === 'function') {
+                    providerPoolManager.markProviderServerError(effectiveProvider, { uuid: effectiveUuid }, error.message);
+                } else if (typeof providerPoolManager.markProviderUnhealthyImmediate === 'function') {
+                    providerPoolManager.markProviderUnhealthyImmediate(effectiveProvider, { uuid: effectiveUuid }, error.message);
+                } else {
+                    providerPoolManager.markProviderUnhealthy(effectiveProvider, { uuid: effectiveUuid }, error.message);
+                }
+            } else {
+                if (typeof providerPoolManager.markProviderDeterministicFailure === 'function') {
+                    providerPoolManager.markProviderDeterministicFailure(effectiveProvider, { uuid: effectiveUuid }, error.message);
+                } else if (typeof providerPoolManager.markProviderUnhealthyImmediate === 'function') {
+                    providerPoolManager.markProviderUnhealthyImmediate(effectiveProvider, { uuid: effectiveUuid }, error.message);
+                } else {
+                    providerPoolManager.markProviderUnhealthy(effectiveProvider, { uuid: effectiveUuid }, error.message);
+                }
+            }
+
+            try {
+                const { getApiServiceWithFallback } = await import('./service-manager.js');
+                const result = await getApiServiceWithFallback(requestConfig, effectiveModel);
+                if (result?.service) {
+                    const previousProvider = effectiveProvider;
+                    effectiveService = result.service;
+                    effectiveProvider = result.actualProviderType || effectiveProvider;
+                    effectiveUuid = result.uuid || effectiveUuid;
+                    effectiveCustomName = result.serviceConfig?.customName || effectiveCustomName;
+                    if (result.actualModel && result.actualModel !== effectiveModel) {
+                        console.log(`[Content Generation] Model Fallback: ${effectiveModel} -> ${result.actualModel}`);
+                        effectiveModel = result.actualModel;
+                    }
+
+                    if (getProtocolPrefix(previousProvider) !== getProtocolPrefix(effectiveProvider)) {
+                        console.log(`[Request Convert] Fallback 触发，二次转换请求: ${previousProvider} -> ${effectiveProvider}`);
+                        try {
+                            effectiveRequestBody = convertData(effectiveRequestBody, 'request', previousProvider, effectiveProvider);
+                        } catch (convertError) {
+                            console.error(`[Request Convert] 二次转换失败: ${convertError.message}`);
+                            // 视为确定性失败：避免该节点被反复选中
+                            if (typeof providerPoolManager.markProviderDeterministicFailure === 'function') {
+                                providerPoolManager.markProviderDeterministicFailure(effectiveProvider, { uuid: effectiveUuid }, `Request convert failed: ${convertError.message}`);
+                            } else if (typeof providerPoolManager.markProviderUnhealthyImmediate === 'function') {
+                                providerPoolManager.markProviderUnhealthyImmediate(effectiveProvider, { uuid: effectiveUuid }, `Request convert failed: ${convertError.message}`);
+                            }
+                            throw convertError;
+                        }
+                    }
+
+                    const needsConversion = getProtocolPrefix(fromProvider) !== getProtocolPrefix(effectiveProvider);
+                    const retryNativeResponse = await generateContentWithRetry(effectiveService, effectiveProvider, effectiveUuid, effectiveModel, effectiveRequestBody);
+                    const retryText = extractResponseText(retryNativeResponse, effectiveProvider);
+
+                    let retryClientResponse = retryNativeResponse;
+                    if (needsConversion) {
+                        console.log(`[Response Convert] Converting response from ${effectiveProvider} to ${fromProvider}`);
+                        retryClientResponse = convertData(retryNativeResponse, 'response', effectiveProvider, fromProvider, effectiveModel);
+                    }
+
+                    await handleUnifiedResponse(res, JSON.stringify(retryClientResponse), false);
+                    await logConversation('output', retryText, PROMPT_LOG_MODE, PROMPT_LOG_FILENAME);
+
+                    if (providerPoolManager && effectiveUuid) {
+                        const customNameDisplay = effectiveCustomName ? `, ${effectiveCustomName}` : '';
+                        console.log(`[Provider Pool] Increasing usage count for ${effectiveProvider} (${effectiveUuid}${customNameDisplay}) after successful unary request (failover)`);
+                        providerPoolManager.markProviderHealthy(effectiveProvider, { uuid: effectiveUuid });
+                    }
+                    return;
+                }
+            } catch (failoverError) {
+                // failover 过程出错，走统一错误返回
+                error = failoverError;
+            }
         }
 
-        // 使用新方法创建符合 fromProvider 格式的错误响应
+        console.error('\n[Server] Error during unary processing:', error.stack);
+        if (providerPoolManager && effectiveUuid) {
+            const finalStatus = getHttpStatus(error);
+            if (isTransientFailure(error, finalStatus)) {
+                console.log(`[Provider Pool] 一元错误(${finalStatus ?? error?.code ?? 'TRANSIENT'})判定为瞬时错误，不标记节点不健康: ${effectiveProvider} (${effectiveUuid})`);
+            } else if (is5xx(finalStatus)) {
+                console.log(`[Provider Pool] Marking ${effectiveProvider} as unhealthy due to 5xx unary error`);
+                if (typeof providerPoolManager.markProviderServerError === 'function') {
+                    providerPoolManager.markProviderServerError(effectiveProvider, { uuid: effectiveUuid }, error.message);
+                } else if (typeof providerPoolManager.markProviderUnhealthyImmediate === 'function') {
+                    providerPoolManager.markProviderUnhealthyImmediate(effectiveProvider, { uuid: effectiveUuid }, error.message);
+                } else {
+                    providerPoolManager.markProviderUnhealthy(effectiveProvider, { uuid: effectiveUuid }, error.message);
+                }
+            } else if (isDeterministicFailure(finalStatus)) {
+                console.log(`[Provider Pool] Marking ${effectiveProvider} as unhealthy due to deterministic unary error (${finalStatus})`);
+                if (typeof providerPoolManager.markProviderDeterministicFailure === 'function') {
+                    providerPoolManager.markProviderDeterministicFailure(effectiveProvider, { uuid: effectiveUuid }, error.message);
+                } else if (typeof providerPoolManager.markProviderUnhealthyImmediate === 'function') {
+                    providerPoolManager.markProviderUnhealthyImmediate(effectiveProvider, { uuid: effectiveUuid }, error.message);
+                } else {
+                    providerPoolManager.markProviderUnhealthy(effectiveProvider, { uuid: effectiveUuid }, error.message);
+                }
+            } else {
+                console.log(`[Provider Pool] Marking ${effectiveProvider} as unhealthy due to unary error`);
+                providerPoolManager.markProviderUnhealthy(effectiveProvider, { uuid: effectiveUuid }, error.message);
+            }
+        }
+
         const errorResponse = createErrorResponse(error, fromProvider);
         await handleUnifiedResponse(res, JSON.stringify(errorResponse), false);
     }
@@ -486,9 +888,9 @@ export async function handleContentGenerationRequest(req, res, service, endpoint
     
     // 5. Call the appropriate stream or unary handler, passing the provider info.
     if (isStream) {
-        await handleStreamRequest(res, service, model, processedRequestBody, fromProvider, toProvider, CONFIG.PROMPT_LOG_MODE, PROMPT_LOG_FILENAME, providerPoolManager, actualUuid, actualCustomName);
+        await handleStreamRequest(res, service, model, processedRequestBody, fromProvider, toProvider, CONFIG.PROMPT_LOG_MODE, PROMPT_LOG_FILENAME, providerPoolManager, actualUuid, actualCustomName, CONFIG);
     } else {
-        await handleUnaryRequest(res, service, model, processedRequestBody, fromProvider, toProvider, CONFIG.PROMPT_LOG_MODE, PROMPT_LOG_FILENAME, providerPoolManager, actualUuid, actualCustomName);
+        await handleUnaryRequest(res, service, model, processedRequestBody, fromProvider, toProvider, CONFIG.PROMPT_LOG_MODE, PROMPT_LOG_FILENAME, providerPoolManager, actualUuid, actualCustomName, CONFIG);
     }
 }
 

@@ -1,20 +1,20 @@
 services:
   aiclient-api:
     # 方式一：使用 Docker Hub 预构建镜像（默认，推荐）
-    image: justlikemaki/aiclient-2-api:latest
+    #image: justlikemaki/aiclient-2-api:latest
     
     # 方式二：从 Dockerfile 本地构建（取消下面注释并注释掉上面的 image 行）
-    # build:
-    #   context: ..
-    #   dockerfile: Dockerfile
+    build:
+       context: ..
+       dockerfile: Dockerfile
     
     container_name: aiclient2api
     restart: unless-stopped
     ports:
-      - "3000:3000"
-      - "8085:8085"
-      - "8086:8086"
-      - "19876-19880:19876-19880"
+      - "3060:3000"
+      - "8080:8080"
+      - "8090:8090"
+      - "19776-19780:19776-19780"
     volumes:
       - ./configs:/app/configs
     environment:

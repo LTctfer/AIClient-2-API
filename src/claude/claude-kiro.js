@@ -9,7 +9,6 @@ import * as https from 'https';
 import { getProviderModels } from '../provider-models.js';
 import { countTokens } from '@anthropic-ai/tokenizer';
 import { configureAxiosProxy } from '../proxy-utils.js';
-import { isRetryableNetworkError } from '../common.js';
 import { CLAUDE_DEFAULT_MAX_TOKENS } from '../converters/utils.js';
 
 const KIRO_THINKING = {
@@ -94,6 +93,547 @@ function getSystemRuntimeInfo() {
         osName,
         nodeVersion
     };
+}
+
+// =============================================================================
+// 上下文窗口管理（参考 Cline 的 context-management 策略）
+// =============================================================================
+
+/**
+ * 获取模型的上下文窗口信息
+ * @param {string} model - 模型名称
+ * @returns {{contextWindow: number, maxAllowedSize: number}} 上下文窗口信息
+ */
+function getContextWindowInfo(model) {
+    // 不同模型的上下文窗口大小
+    const contextWindows = {
+        'claude-opus-4-5': 200_000,
+        'claude-opus-4-5-20251101': 200_000,
+        'claude-haiku-4-5': 200_000,
+        'claude-sonnet-4-5': 200_000,
+        'claude-sonnet-4-5-20250929': 200_000,
+        'claude-sonnet-4-20250514': 200_000,
+        'claude-3-7-sonnet-20250219': 200_000,
+    };
+
+    const contextWindow = contextWindows[model] || 200_000;
+
+    // 参考 Cline 的策略：预留 buffer 防止溢出
+    let maxAllowedSize;
+    if (contextWindow >= 200_000) {
+        maxAllowedSize = contextWindow - 40_000; // Claude 模型预留 40k
+    } else if (contextWindow >= 128_000) {
+        maxAllowedSize = contextWindow - 30_000;
+    } else if (contextWindow >= 64_000) {
+        maxAllowedSize = contextWindow - 27_000;
+    } else {
+        maxAllowedSize = Math.max(contextWindow - 20_000, contextWindow * 0.8);
+    }
+
+    return { contextWindow, maxAllowedSize };
+}
+
+/**
+ * 估算消息的 token 数量
+ * @param {Array} messages - 消息数组
+ * @param {string|null} systemPrompt - 系统提示
+ * @param {Array|null} tools - 工具定义
+ * @returns {number} 估算的 token 数量
+ */
+function estimateMessagesTokens(messages, systemPrompt = null, tools = null) {
+    let totalTokens = 0;
+
+    // 计算系统提示的 token
+    if (systemPrompt) {
+        try {
+            totalTokens += countTokens(systemPrompt);
+        } catch {
+            totalTokens += Math.ceil(systemPrompt.length / 4);
+        }
+    }
+
+    // 计算消息的 token
+    for (const message of messages) {
+        let content = '';
+        if (typeof message.content === 'string') {
+            content = message.content;
+        } else if (Array.isArray(message.content)) {
+            for (const part of message.content) {
+                if (part.type === 'text' && part.text) {
+                    content += part.text;
+                } else if (part.type === 'tool_result' && part.content) {
+                    content += typeof part.content === 'string' ? part.content : JSON.stringify(part.content);
+                } else if (part.type === 'tool_use' && part.input) {
+                    content += JSON.stringify(part.input);
+                } else if (part.type === 'thinking' && part.thinking) {
+                    content += part.thinking;
+                } else if (part.type === 'image') {
+                    // 图片估算为 1600 tokens
+                    totalTokens += 1600;
+                }
+            }
+        }
+
+        try {
+            totalTokens += countTokens(content);
+        } catch {
+            totalTokens += Math.ceil(content.length / 4);
+        }
+    }
+
+    // 计算工具定义的 token
+    if (tools && Array.isArray(tools) && tools.length > 0) {
+        const toolsStr = JSON.stringify(tools);
+        try {
+            totalTokens += countTokens(toolsStr);
+        } catch {
+            totalTokens += Math.ceil(toolsStr.length / 4);
+        }
+    }
+
+    return totalTokens;
+}
+
+/**
+ * 生成截断提示消息
+ * @param {number} truncatedCount - 被截断的消息数量
+ * @param {string} language - 语言 ('zh' 或 'en')
+ * @returns {string} 截断提示文本
+ */
+function generateTruncationHint(truncatedCount, language = 'en') {
+    if (language === 'zh') {
+        return `[系统提示: 由于上下文长度限制，之前的 ${truncatedCount} 条消息已被截断。对话将从最近的上下文继续。如果您需要之前对话中的信息，请要求用户重新提供。]`;
+    }
+    return `[System Note: Due to context length limits, ${truncatedCount} earlier messages have been truncated. The conversation continues from the most recent context below. If you need information from earlier in the conversation, please ask the user to provide it again.]`;
+}
+
+/**
+ * 智能截断消息历史（透明截断 + 注入提示）
+ * 参考 Cline 的 ContextManager.getNextTruncationRange 策略
+ * @param {Array} messages - 原始消息数组
+ * @param {string} model - 模型名称
+ * @param {string|null} systemPrompt - 系统提示
+ * @param {Array|null} tools - 工具定义
+ * @param {Object} config - 配置选项
+ * @returns {{messages: Array, truncated: boolean, truncatedCount: number}} 处理后的消息
+ */
+function truncateMessagesWithHint(messages, model, systemPrompt = null, tools = null, config = {}) {
+    // 配置参数
+    const thresholdPercent = config.KIRO_CONTEXT_THRESHOLD_PERCENT ?? 85;
+    const keepRecentMessages = config.KIRO_KEEP_RECENT_MESSAGES ?? 20;
+    const keepFirstPair = config.KIRO_KEEP_FIRST_PAIR ?? true;
+    const truncationLanguage = config.KIRO_TRUNCATION_LANGUAGE ?? 'en';
+    const enableTruncation = config.KIRO_ENABLE_CONTEXT_TRUNCATION ?? true;
+
+    // 如果禁用截断，直接返回原消息
+    if (!enableTruncation) {
+        return { messages, truncated: false, truncatedCount: 0 };
+    }
+
+    // 获取上下文窗口信息
+    const { maxAllowedSize } = getContextWindowInfo(model);
+    const threshold = Math.floor(maxAllowedSize * (thresholdPercent / 100));
+
+    // 估算当前 token 数量
+    const currentTokens = estimateMessagesTokens(messages, systemPrompt, tools);
+
+    console.log(`[Kiro Context] Current tokens: ${currentTokens}, Threshold: ${threshold} (${thresholdPercent}% of ${maxAllowedSize})`);
+
+    // 如果未超过阈值，不需要截断
+    if (currentTokens <= threshold) {
+        return { messages, truncated: false, truncatedCount: 0 };
+    }
+
+    console.log(`[Kiro Context] Token count ${currentTokens} exceeds threshold ${threshold}, starting truncation...`);
+
+    // 深拷贝消息数组，避免修改原数组
+    let processedMessages = JSON.parse(JSON.stringify(messages));
+
+    // 确保消息数量足够进行截断
+    if (processedMessages.length <= 4) {
+        console.log('[Kiro Context] Too few messages to truncate, skipping');
+        return { messages, truncated: false, truncatedCount: 0 };
+    }
+
+    // 计算要保留的消息
+    // 策略：保留第一对 user-assistant 消息 + 最近的 N 条消息
+    let firstPairCount = 0;
+    let firstPair = [];
+
+    if (keepFirstPair && processedMessages.length >= 2) {
+        // 找到第一对 user-assistant 消息
+        if (processedMessages[0].role === 'user') {
+            firstPair.push(processedMessages[0]);
+            firstPairCount = 1;
+            if (processedMessages.length > 1 && processedMessages[1].role === 'assistant') {
+                firstPair.push(processedMessages[1]);
+                firstPairCount = 2;
+            }
+        }
+    }
+
+    // 计算要保留的最近消息数量（确保是偶数，保持 user-assistant 配对）
+    let recentCount = Math.min(keepRecentMessages, processedMessages.length - firstPairCount);
+    recentCount = Math.floor(recentCount / 2) * 2; // 确保偶数
+
+    // 如果保留的消息太少，至少保留 4 条
+    if (recentCount < 4) {
+        recentCount = Math.min(4, processedMessages.length - firstPairCount);
+    }
+
+    // 获取最近的消息
+    const recentMessages = processedMessages.slice(-recentCount);
+
+    // 计算被截断的消息数量
+    const truncatedCount = processedMessages.length - firstPairCount - recentCount;
+
+    if (truncatedCount <= 0) {
+        console.log('[Kiro Context] No messages to truncate after calculation');
+        return { messages, truncated: false, truncatedCount: 0 };
+    }
+
+    // 构建截断提示消息
+    const truncationHint = {
+        role: 'user',
+        content: [{
+            type: 'text',
+            text: generateTruncationHint(truncatedCount, truncationLanguage)
+        }]
+    };
+
+    // 构建截断后的消息数组
+    let truncatedMessages = [];
+
+    if (firstPair.length > 0) {
+        truncatedMessages.push(...firstPair);
+    }
+
+    // 在第一对消息和最近消息之间插入截断提示
+    truncatedMessages.push(truncationHint);
+
+    // 如果截断提示后面紧跟的是 assistant 消息，需要添加一个占位 assistant 响应
+    if (recentMessages.length > 0 && recentMessages[0].role === 'assistant') {
+        truncatedMessages.push({
+            role: 'assistant',
+            content: [{ type: 'text', text: 'Understood. I will continue from the recent context.' }]
+        });
+    }
+
+    truncatedMessages.push(...recentMessages);
+
+    // 验证截断后的 token 数量
+    const newTokens = estimateMessagesTokens(truncatedMessages, systemPrompt, tools);
+    console.log(`[Kiro Context] After truncation: ${truncatedMessages.length} messages, ${newTokens} tokens (was ${processedMessages.length} messages, ${currentTokens} tokens)`);
+    console.log(`[Kiro Context] Truncated ${truncatedCount} messages`);
+
+    // 如果截断后仍然超过阈值，进行更激进的截断
+    if (newTokens > threshold && recentCount > 6) {
+        console.log('[Kiro Context] Still over threshold, performing aggressive truncation...');
+        const aggressiveResult = truncateMessagesWithHint(
+            truncatedMessages,
+            model,
+            systemPrompt,
+            tools,
+            {
+                ...config,
+                KIRO_KEEP_RECENT_MESSAGES: Math.floor(recentCount / 2),
+                KIRO_KEEP_FIRST_PAIR: false // 第二轮不再保留第一对
+            }
+        );
+        return {
+            messages: aggressiveResult.messages,
+            truncated: true,
+            truncatedCount: truncatedCount + aggressiveResult.truncatedCount
+        };
+    }
+
+    return {
+        messages: truncatedMessages,
+        truncated: true,
+        truncatedCount
+    };
+}
+
+/**
+ * 优化重复的文件读取内容（减少 token 消耗）
+ * 参考 Cline 的 findAndPotentiallySaveFileReadContextHistoryUpdates
+ * @param {Array} messages - 消息数组
+ * @param {Object} config - 配置选项
+ * @returns {Array} 优化后的消息数组
+ */
+function optimizeFileReads(messages, config = {}) {
+    const enableOptimization = config.KIRO_ENABLE_FILE_READ_OPTIMIZATION ?? true;
+    const keepRecentFileReads = config.KIRO_KEEP_RECENT_FILE_READS ?? 3;
+
+    if (!enableOptimization) {
+        return messages;
+    }
+
+    // 文件内容的正则匹配模式
+    const fileContentPattern = /<file_content\s+path="([^"]*)">([\s\S]*?)<\/file_content>/g;
+
+    // 记录每个文件路径最后出现的消息索引
+    const fileLastSeen = new Map();
+
+    // 第一遍：记录每个文件最后出现的位置
+    messages.forEach((msg, idx) => {
+        if (msg.role !== 'user') return;
+
+        const content = typeof msg.content === 'string' ? msg.content :
+            (Array.isArray(msg.content) ? msg.content.map(c => c.text || '').join('') : '');
+
+        let match;
+        const regex = new RegExp(fileContentPattern.source, fileContentPattern.flags);
+        while ((match = regex.exec(content)) !== null) {
+            fileLastSeen.set(match[1], idx);
+        }
+    });
+
+    // 第二遍：替换非最近的重复文件内容
+    return messages.map((msg, idx) => {
+        if (msg.role !== 'user') return msg;
+
+        let content = typeof msg.content === 'string' ? msg.content :
+            (Array.isArray(msg.content) ? msg.content.map(c => c.text || '').join('') : '');
+
+        let modified = false;
+        const regex = new RegExp(fileContentPattern.source, fileContentPattern.flags);
+
+        content = content.replace(regex, (match, filePath, fileContent) => {
+            const lastSeenIdx = fileLastSeen.get(filePath);
+            const distanceFromLast = messages.length - 1 - idx;
+
+            // 如果不是最近 N 次出现，且不是最后一次出现，则替换为占位符
+            if (distanceFromLast > keepRecentFileReads && idx !== lastSeenIdx) {
+                modified = true;
+                return `<file_content path="${filePath}">[File content shown earlier in conversation - ${fileContent.length} characters]</file_content>`;
+            }
+            return match;
+        });
+
+        if (modified) {
+            if (typeof msg.content === 'string') {
+                return { ...msg, content };
+            } else if (Array.isArray(msg.content)) {
+                return {
+                    ...msg,
+                    content: msg.content.map(c => {
+                        if (c.type === 'text') {
+                            return { ...c, text: content };
+                        }
+                        return c;
+                    })
+                };
+            }
+        }
+
+        return msg;
+    });
+}
+
+// =============================================================================
+// Kiro tools 压缩与限额（避免上游 5xx）
+// =============================================================================
+
+function toSafeErrorLog(error) {
+    const status = error?.response?.status ?? error?.statusCode ?? error?.status;
+    const headers = error?.response?.headers || {};
+    const requestId = headers['x-amzn-requestid'] || null;
+    const errorType = headers['x-amzn-errortype'] || null;
+
+    return {
+        message: error?.message || String(error),
+        code: error?.code || null,
+        status: typeof status === 'number' ? status : null,
+        requestId,
+        errorType,
+    };
+}
+
+function getUtf8ByteLength(value) {
+    try {
+        const text = typeof value === 'string' ? value : JSON.stringify(value);
+        return Buffer.byteLength(text, 'utf8');
+    } catch {
+        return Number.MAX_SAFE_INTEGER;
+    }
+}
+
+function truncateText(text, maxChars) {
+    if (!text) return "";
+    const str = String(text);
+    if (!Number.isFinite(maxChars) || maxChars <= 0) return "";
+    if (str.length <= maxChars) return str;
+    return `${str.slice(0, maxChars)}…`;
+}
+
+function sanitizeJsonSchema(schema, limits, depth = 0) {
+    const maxDepth = limits?.schemaMaxDepth ?? 8;
+    const maxProperties = limits?.schemaMaxProperties ?? 60;
+    const maxArrayItems = limits?.schemaMaxArrayItems ?? 40;
+
+    if (schema == null) return {};
+    if (Array.isArray(schema)) {
+        return schema.slice(0, maxArrayItems).map((v) => sanitizeJsonSchema(v, limits, depth + 1));
+    }
+    if (typeof schema !== 'object') return schema;
+
+    if (depth >= maxDepth) {
+        // 深度过深时只保留 type（如有）以避免 schema 体积失控
+        const shallow = {};
+        if (typeof schema.type === 'string') shallow.type = schema.type;
+        return shallow;
+    }
+
+    const cleaned = {};
+    for (const [key, value] of Object.entries(schema)) {
+        // 去掉高噪声/高体积元数据字段
+        if (
+            key === "$schema" ||
+            key === "title" ||
+            key === "description" ||
+            key === "examples" ||
+            key === "example" ||
+            key === "$comment" ||
+            key === "comment" ||
+            key === "deprecated" ||
+            key === "readOnly" ||
+            key === "writeOnly" ||
+            key === "id"
+        ) {
+            continue;
+        }
+        // 去掉自定义扩展字段（x-*）
+        if (key.startsWith("x-") || key.startsWith("X-")) {
+            continue;
+        }
+
+        if (key === "properties" && value && typeof value === "object" && !Array.isArray(value)) {
+            const entries = Object.entries(value).slice(0, maxProperties);
+            const next = {};
+            for (const [propKey, propVal] of entries) {
+                next[propKey] = sanitizeJsonSchema(propVal, limits, depth + 1);
+            }
+            cleaned.properties = next;
+            continue;
+        }
+
+        cleaned[key] = sanitizeJsonSchema(value, limits, depth + 1);
+    }
+    return cleaned;
+}
+
+function buildKiroToolsContext(tools) {
+    if (!Array.isArray(tools) || tools.length === 0) return {};
+    return {
+        tools: tools.map((tool) => ({
+            toolSpecification: {
+                name: tool.name,
+                description: tool.description || "",
+                inputSchema: { json: tool.input_schema || {} },
+            },
+        })),
+    };
+}
+
+function compressToolsForKiro(tools, config) {
+    if (!Array.isArray(tools) || tools.length === 0) {
+        console.log(`[Kiro Tools] 没有工具传入或工具为空数组, tools=${JSON.stringify(tools)?.substring(0, 200)}`);
+        return {};
+    }
+
+    console.log(`[Kiro Tools] 收到 ${tools.length} 个工具，开始处理...`);
+
+    // 检查是否禁用工具压缩（用于调试或 MCP 兼容性）
+    const disableCompression = config?.KIRO_DISABLE_TOOLS_COMPRESSION ?? false;
+    if (disableCompression) {
+        console.log(`[Kiro Tools] 工具压缩已禁用，直接使用原始工具定义`);
+        return buildKiroToolsContext(tools);
+    }
+
+    const limits = {
+        // 增大默认限制以支持更多 MCP 工具
+        maxToolsCount: config?.KIRO_TOOLS_MAX_COUNT ?? 64,           // 从 16 增加到 64
+        maxToolsTotalBytes: config?.KIRO_TOOLS_TOTAL_MAX_BYTES ?? 128_000,  // 从 24KB 增加到 128KB
+        maxToolNameChars: config?.KIRO_TOOL_NAME_MAX_CHARS ?? 128,   // 从 64 增加到 128
+        maxToolDescChars: config?.KIRO_TOOL_DESC_MAX_CHARS ?? 1024,  // 从 512 增加到 1024
+        schemaMaxDepth: config?.KIRO_SCHEMA_MAX_DEPTH ?? 12,         // 从 8 增加到 12
+        schemaMaxProperties: config?.KIRO_SCHEMA_MAX_PROPERTIES ?? 100,  // 从 60 增加到 100
+        schemaMaxArrayItems: config?.KIRO_SCHEMA_MAX_ARRAY_ITEMS ?? 60,  // 从 40 增加到 60
+        minimalToolsCount: config?.KIRO_TOOLS_MINIMAL_COUNT ?? 32,   // 从 8 增加到 32
+    };
+
+    // 1) 标准化：截断 description + 清洗 schema
+    let normalized = tools
+        .filter((t) => t && typeof t === "object")
+        .map((t) => ({
+            name: truncateText(String(t.name || "").trim(), limits.maxToolNameChars),
+            description: truncateText(String(t.description || ""), limits.maxToolDescChars),
+            input_schema: sanitizeJsonSchema(t.input_schema || {}, limits),
+        }))
+        .filter((t) => t.name);
+
+    if (normalized.length === 0) return {};
+
+    // 2) 限制工具数量（优先保留前 N 个）
+    if (normalized.length > limits.maxToolsCount) {
+        console.log(`[Kiro Tools] 工具数量 ${normalized.length} 超过限制 ${limits.maxToolsCount}，截断到前 ${limits.maxToolsCount} 个`);
+        normalized = normalized.slice(0, limits.maxToolsCount);
+    }
+
+    // 3) 计算体积，超阈值则逐级降级
+    let toolsContext = buildKiroToolsContext(normalized);
+    let bytes = getUtf8ByteLength(toolsContext);
+    if (bytes <= limits.maxToolsTotalBytes) {
+        console.log(`[Kiro Tools] 工具上下文大小: ${bytes} 字节，共 ${normalized.length} 个工具`);
+        return toolsContext;
+    }
+
+    console.log(`[Kiro Tools] 工具上下文过大(${bytes}字节 > ${limits.maxToolsTotalBytes}字节)，开始降级...`);
+
+    // 3.1) 去掉 description
+    const noDesc = normalized.map((t) => ({ ...t, description: "" }));
+    toolsContext = buildKiroToolsContext(noDesc);
+    bytes = getUtf8ByteLength(toolsContext);
+    if (bytes <= limits.maxToolsTotalBytes) {
+        console.log(`[Kiro Tools] 已降级：移除 description（${bytes}字节，${noDesc.length} 个工具）`);
+        return toolsContext;
+    }
+
+    // 3.2) 降低工具数量到 minimalToolsCount
+    const minimalCount = Math.max(1, Math.min(limits.minimalToolsCount, noDesc.length));
+    const fewerTools = noDesc.slice(0, minimalCount);
+    toolsContext = buildKiroToolsContext(fewerTools);
+    bytes = getUtf8ByteLength(toolsContext);
+    if (bytes <= limits.maxToolsTotalBytes) {
+        console.log(`[Kiro Tools] 已降级：限制工具数量为 ${minimalCount}（${bytes}字节）`);
+        return toolsContext;
+    }
+
+    // 3.3) 最小 schema（仅保留空 object）
+    const minimalSchemaTools = fewerTools.map((t) => ({
+        name: t.name,
+        description: "",
+        input_schema: { type: "object", properties: {} },
+    }));
+    toolsContext = buildKiroToolsContext(minimalSchemaTools);
+    bytes = getUtf8ByteLength(toolsContext);
+    if (bytes <= limits.maxToolsTotalBytes) {
+        console.log(`[Kiro Tools] 已降级：最小 schema（${bytes}字节，${minimalSchemaTools.length} 个工具）`);
+        return toolsContext;
+    }
+
+    // 3.4) 最后手段：保留尽可能多的工具（不再完全丢弃）
+    // 逐步减少工具数量直到满足大小限制
+    let finalTools = minimalSchemaTools;
+    while (finalTools.length > 1 && bytes > limits.maxToolsTotalBytes) {
+        finalTools = finalTools.slice(0, Math.max(1, Math.floor(finalTools.length * 0.75)));
+        toolsContext = buildKiroToolsContext(finalTools);
+        bytes = getUtf8ByteLength(toolsContext);
+    }
+
+    console.log(`[Kiro Tools] 最终降级：保留 ${finalTools.length} 个工具（${bytes}字节）`);
+    return toolsContext;
 }
 
 // Helper functions for tool calls and JSON parsing
@@ -674,13 +1214,32 @@ export class KiroApiService {
      * Build CodeWhisperer request from OpenAI messages
      */
     buildCodewhispererRequest(messages, model, tools = null, inSystemPrompt = null, thinking = null) {
+        console.log(`[Kiro] buildCodewhispererRequest 被调用，tools 参数: ${tools ? `数组长度=${tools.length}` : 'null/undefined'}`);
         const conversationId = uuidv4();
 
         let systemPrompt = this.getContentText(inSystemPrompt);
-        const processedMessages = messages;
+        let processedMessages = messages;
 
         if (processedMessages.length === 0) {
             throw new Error('No user messages found');
+        }
+
+        // === 上下文管理：优化文件读取 + 智能截断 ===
+        // 1. 优化重复的文件读取内容
+        processedMessages = optimizeFileReads(processedMessages, this.config);
+
+        // 2. 智能截断消息历史（如果超过阈值）
+        const truncationResult = truncateMessagesWithHint(
+            processedMessages,
+            model,
+            systemPrompt,
+            tools,
+            this.config
+        );
+        processedMessages = truncationResult.messages;
+
+        if (truncationResult.truncated) {
+            console.log(`[Kiro Context] Messages truncated: ${truncationResult.truncatedCount} messages removed`);
         }
 
         // === Thinking 模式（与 kiro.rs-master 保持一致）===
@@ -742,18 +1301,8 @@ export class KiroApiService {
 
         const codewhispererModel = MODEL_MAPPING[model] || MODEL_MAPPING[this.modelName];
 
-        let toolsContext = {};
-        if (tools && Array.isArray(tools) && tools.length > 0) {
-            toolsContext = {
-                tools: tools.map(tool => ({
-                    toolSpecification: {
-                        name: tool.name,
-                        description: tool.description || "",
-                        inputSchema: { json: tool.input_schema || {} }
-                    }
-                }))
-            };
-        }
+        // tools 压缩与限额：避免传入超大 schema/description 触发上游 InternalServerException(500)
+        const toolsContext = compressToolsForKiro(tools, this.config);
 
         const history = [];
         let startIndex = 0;
@@ -1042,6 +1591,9 @@ export class KiroApiService {
         }
         if (Object.keys(toolsContext).length > 0 && toolsContext.tools) {
             userInputMessageContext.tools = toolsContext.tools;
+            console.log(`[Kiro Tools] 工具已添加到请求中，共 ${toolsContext.tools.length} 个工具`);
+        } else {
+            console.log(`[Kiro Tools] 警告：toolsContext 为空，工具未被添加到请求中`);
         }
 
         // 只有当 userInputMessageContext 有内容时才添加
@@ -1160,12 +1712,10 @@ export class KiroApiService {
 
 
     /**
-     * 调用 API 并处理错误重试
+     * 调用 API（重试逻辑已上收至调度层；provider 层仅保留一次 403 刷新重试）
      */
     async callApi(method, model, body, isRetry = false, retryCount = 0) {
         if (!this.isInitialized) await this.initialize();
-        const maxRetries = this.config.REQUEST_MAX_RETRIES || 3;
-        const baseDelay = this.config.REQUEST_BASE_DELAY || 1000; // 1 second base delay
 
         const requestData = this.buildCodewhispererRequest(body.messages, model, body.tools, body.system, body.thinking);
 
@@ -1183,10 +1733,6 @@ export class KiroApiService {
         } catch (error) {
             const status = error.response?.status;
             const errorCode = error.code;
-            const errorMessage = error.message || '';
-
-            // 检查是否为可重试的网络错误
-            const isNetworkError = isRetryableNetworkError(error);
 
             if (status === 403 && !isRetry) {
                 console.log('[Kiro] Received 403. Attempting token refresh and retrying...');
@@ -1197,31 +1743,6 @@ export class KiroApiService {
                     console.error('[Kiro] Token refresh failed during 403 retry:', refreshError.message);
                     throw refreshError;
                 }
-            }
-
-            // Handle 429 (Too Many Requests) with exponential backoff
-            if (status === 429 && retryCount < maxRetries) {
-                const delay = baseDelay * Math.pow(2, retryCount);
-                console.log(`[Kiro] Received 429 (Too Many Requests). Retrying in ${delay}ms... (attempt ${retryCount + 1}/${maxRetries})`);
-                await new Promise(resolve => setTimeout(resolve, delay));
-                return this.callApi(method, model, body, isRetry, retryCount + 1);
-            }
-
-            // Handle other retryable errors (5xx server errors)
-            if (status >= 500 && status < 600 && retryCount < maxRetries) {
-                const delay = baseDelay * Math.pow(2, retryCount);
-                console.log(`[Kiro] Received ${status} server error. Retrying in ${delay}ms... (attempt ${retryCount + 1}/${maxRetries})`);
-                await new Promise(resolve => setTimeout(resolve, delay));
-                return this.callApi(method, model, body, isRetry, retryCount + 1);
-            }
-
-            // Handle network errors (ECONNRESET, ETIMEDOUT, etc.) with exponential backoff
-            if (isNetworkError && retryCount < maxRetries) {
-                const delay = baseDelay * Math.pow(2, retryCount);
-                const errorIdentifier = errorCode || errorMessage.substring(0, 50);
-                console.log(`[Kiro] Network error (${errorIdentifier}). Retrying in ${delay}ms... (attempt ${retryCount + 1}/${maxRetries})`);
-                await new Promise(resolve => setTimeout(resolve, delay));
-                return this.callApi(method, model, body, isRetry, retryCount + 1);
             }
 
             console.error(`[Kiro] API call failed (Status: ${status}, Code: ${errorCode}):`, error.message);
@@ -1300,7 +1821,7 @@ export class KiroApiService {
 
             return this.buildClaudeResponse(responseText, false, 'assistant', model, toolCalls, inputTokens);
         } catch (error) {
-            console.error('[Kiro] Error in generateContent:', error);
+            console.error('[Kiro] Error in generateContent:', toSafeErrorLog(error));
             throw new Error(`Error processing response: ${error.message}`);
         }
     }
@@ -1455,8 +1976,6 @@ export class KiroApiService {
      */
     async * streamApiReal(method, model, body, isRetry = false, retryCount = 0) {
         if (!this.isInitialized) await this.initialize();
-        const maxRetries = this.config.REQUEST_MAX_RETRIES || 3;
-        const baseDelay = this.config.REQUEST_BASE_DELAY || 1000;
 
         const requestData = this.buildCodewhispererRequest(body.messages, model, body.tools, body.system, body.thinking);
 
@@ -1515,42 +2034,11 @@ export class KiroApiService {
 
             const status = error.response?.status;
             const errorCode = error.code;
-            const errorMessage = error.message || '';
-
-            // 检查是否为可重试的网络错误
-            const isNetworkError = isRetryableNetworkError(error);
 
             if (status === 403 && !isRetry) {
                 console.log('[Kiro] Received 403 in stream. Attempting token refresh and retrying...');
                 await this.initializeAuth(true);
                 yield* this.streamApiReal(method, model, body, true, retryCount);
-                return;
-            }
-
-            if (status === 429 && retryCount < maxRetries) {
-                const delay = baseDelay * Math.pow(2, retryCount);
-                console.log(`[Kiro] Received 429 in stream. Retrying in ${delay}ms... (attempt ${retryCount + 1}/${maxRetries})`);
-                await new Promise(resolve => setTimeout(resolve, delay));
-                yield* this.streamApiReal(method, model, body, isRetry, retryCount + 1);
-                return;
-            }
-
-            // Handle 5xx server errors with exponential backoff
-            if (status >= 500 && status < 600 && retryCount < maxRetries) {
-                const delay = baseDelay * Math.pow(2, retryCount);
-                console.log(`[Kiro] Received ${status} server error in stream. Retrying in ${delay}ms... (attempt ${retryCount + 1}/${maxRetries})`);
-                await new Promise(resolve => setTimeout(resolve, delay));
-                yield* this.streamApiReal(method, model, body, isRetry, retryCount + 1);
-                return;
-            }
-
-            // Handle network errors (ECONNRESET, ETIMEDOUT, etc.) with exponential backoff
-            if (isNetworkError && retryCount < maxRetries) {
-                const delay = baseDelay * Math.pow(2, retryCount);
-                const errorIdentifier = errorCode || errorMessage.substring(0, 50);
-                console.log(`[Kiro] Network error (${errorIdentifier}) in stream. Retrying in ${delay}ms... (attempt ${retryCount + 1}/${maxRetries})`);
-                await new Promise(resolve => setTimeout(resolve, delay));
-                yield* this.streamApiReal(method, model, body, isRetry, retryCount + 1);
                 return;
             }
 
@@ -1569,7 +2057,7 @@ export class KiroApiService {
         try {
             return await this.callApi(method, model, body, isRetry, retryCount);
         } catch (error) {
-            console.error('[Kiro] Error calling API:', error);
+            console.error('[Kiro] Error calling API:', toSafeErrorLog(error));
             throw error;
         }
     }
@@ -1577,6 +2065,12 @@ export class KiroApiService {
     // 真正的流式传输实现
     async * generateContentStream(model, requestBody) {
         if (!this.isInitialized) await this.initialize();
+
+        // 调试日志：检查 requestBody 中的 tools
+        console.log(`[Kiro Debug] generateContentStream 收到 requestBody，tools: ${requestBody?.tools ? `数组长度=${requestBody.tools.length}` : 'null/undefined'}`);
+        if (requestBody?.tools && requestBody.tools.length > 0) {
+            console.log(`[Kiro Debug] 前3个工具名称: ${requestBody.tools.slice(0, 3).map(t => t.name).join(', ')}`);
+        }
 
         // 检查 token 是否即将过期,如果是则先刷新
         if (this.isExpiryDateNear()) {
@@ -1951,7 +2445,7 @@ export class KiroApiService {
             yield { type: "message_stop" };
 
         } catch (error) {
-            console.error('[Kiro] Error in streaming generation:', error);
+            console.error('[Kiro] Error in streaming generation:', toSafeErrorLog(error));
             throw new Error(`Error processing response: ${error.message}`);
         }
     }
@@ -2373,7 +2867,7 @@ export class KiroApiService {
                     throw refreshError;
                 }
             }
-            console.error('[Kiro] Failed to fetch usage limits:', error.message, error);
+            console.error('[Kiro] Failed to fetch usage limits:', toSafeErrorLog(error));
             throw error;
         }
     }

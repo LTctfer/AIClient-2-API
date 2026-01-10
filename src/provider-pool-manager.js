@@ -28,6 +28,16 @@ export class ProviderPoolManager {
         // 使用 ?? 运算符确保 0 也能被正确设置，而不是被 || 替换为默认值
         this.maxErrorCount = options.maxErrorCount ?? 3; // Default to 3 errors before marking unhealthy
         this.healthCheckInterval = options.healthCheckInterval ?? 10 * 60 * 1000; // Default to 10 minutes
+
+        // 号池熔断/冷却策略：
+        // - 确定性失败（payload/格式等）应立即踢出并进入更长 cooldown
+        // - 5xx 走快速切换 + 熔断，但 cooldown 可以更短以便恢复
+        this.serverErrorCooldownMs = options.serverErrorCooldownMs
+            ?? this.globalConfig.PROVIDER_SERVER_ERROR_COOLDOWN_MS
+            ?? 5 * 60 * 1000; // 默认 5 分钟
+        this.deterministicCooldownMs = options.deterministicCooldownMs
+            ?? this.globalConfig.PROVIDER_DETERMINISTIC_COOLDOWN_MS
+            ?? 30 * 60 * 1000; // 默认 30 分钟
         
         // 日志级别控制
         this.logLevel = options.logLevel || 'info'; // 'debug', 'info', 'warn', 'error'
@@ -86,6 +96,12 @@ export class ProviderPoolManager {
                 providerConfig.lastUsed = providerConfig.lastUsed !== undefined ? providerConfig.lastUsed : null;
                 providerConfig.usageCount = providerConfig.usageCount !== undefined ? providerConfig.usageCount : 0;
                 providerConfig.errorCount = providerConfig.errorCount !== undefined ? providerConfig.errorCount : 0;
+
+                // 熔断冷却相关字段
+                providerConfig.cooldownUntil = providerConfig.cooldownUntil instanceof Date
+                    ? providerConfig.cooldownUntil.toISOString()
+                    : (providerConfig.cooldownUntil || null);
+                providerConfig.lastErrorCategory = providerConfig.lastErrorCategory || null;
                 
                 // 优化2: 简化 lastErrorTime 处理逻辑
                 providerConfig.lastErrorTime = providerConfig.lastErrorTime instanceof Date
@@ -123,8 +139,14 @@ export class ProviderPoolManager {
         }
 
         const availableProviders = this.providerStatus[providerType] || [];
+        const now = Date.now();
+        const isInCooldown = (cfg) => {
+            if (!cfg?.cooldownUntil) return false;
+            const ts = new Date(cfg.cooldownUntil).getTime();
+            return Number.isFinite(ts) && now < ts;
+        };
         let availableAndHealthyProviders = availableProviders.filter(p =>
-            p.config.isHealthy && !p.config.isDisabled
+            p.config.isHealthy && !p.config.isDisabled && !isInCooldown(p.config)
         );
 
         // 如果指定了模型，则排除不支持该模型的提供商
@@ -148,6 +170,35 @@ export class ProviderPoolManager {
         }
 
         if (availableAndHealthyProviders.length === 0) {
+            // 兜底逻辑：如果所有节点都在 cooldown 中，选择"最早过期"的节点
+            const now = Date.now();
+            const cooldownProviders = availableProviders.filter(p => {
+                if (p.config.isDisabled) return false;
+                if (!p.config.cooldownUntil) return false;
+                const ts = new Date(p.config.cooldownUntil).getTime();
+                return Number.isFinite(ts) && now < ts;
+            });
+
+            if (cooldownProviders.length > 0) {
+                // 按 cooldownUntil 升序排序，选择最早过期的
+                const earliestExpiring = cooldownProviders.sort((a, b) => {
+                    const tsA = new Date(a.config.cooldownUntil).getTime();
+                    const tsB = new Date(b.config.cooldownUntil).getTime();
+                    return tsA - tsB;
+                })[0];
+
+                this._log('warn', `All providers in cooldown for type: ${providerType}. Falling back to earliest-expiring: ${earliestExpiring.config.uuid} (cooldownUntil: ${earliestExpiring.config.cooldownUntil})`);
+
+                // 更新使用信息（除非明确跳过）
+                if (!options.skipUsageCount) {
+                    earliestExpiring.config.lastUsed = new Date().toISOString();
+                    earliestExpiring.config.usageCount++;
+                    this._debouncedSave(providerType);
+                }
+
+                return earliestExpiring.config;
+            }
+
             this._log('warn', `No available and healthy providers for type: ${providerType}`);
             return null;
         }
@@ -354,7 +405,16 @@ export class ProviderPoolManager {
         if (providers.length === 0) {
             return true;
         }
-        return providers.every(p => !p.config.isHealthy || p.config.isDisabled);
+        const now = Date.now();
+        return providers.every(p => {
+            if (p.config.isDisabled) return true;
+            if (!p.config.isHealthy) return true;
+            if (p.config.cooldownUntil) {
+                const ts = new Date(p.config.cooldownUntil).getTime();
+                if (Number.isFinite(ts) && now < ts) return true;
+            }
+            return false;
+        });
     }
 
     /**
@@ -420,6 +480,94 @@ export class ProviderPoolManager {
     }
 
     /**
+     * 立即将提供商标记为不健康（用于连续 5xx 等“高确定性失败”场景，快速触发 fallback）。
+     * @param {string} providerType - The type of the provider.
+     * @param {object} providerConfig - The configuration of the provider to mark.
+     * @param {string} [errorMessage] - Optional error message to store.
+     */
+    markProviderUnhealthyImmediate(providerType, providerConfig, errorMessage = null) {
+        if (!providerConfig?.uuid) {
+            this._log('error', 'Invalid providerConfig in markProviderUnhealthyImmediate');
+            return;
+        }
+
+        const provider = this._findProvider(providerType, providerConfig.uuid);
+        if (provider) {
+            provider.config.errorCount = this.maxErrorCount;
+            provider.config.isHealthy = false;
+            provider.config.lastErrorTime = new Date().toISOString();
+            // 更新 lastUsed 时间，避免 LRU 策略反复选中失败节点
+            provider.config.lastUsed = new Date().toISOString();
+
+            if (errorMessage) {
+                provider.config.lastErrorMessage = errorMessage;
+            }
+
+            this._log('warn', `已立即标记为不健康: ${providerConfig.uuid} (${providerType})`);
+            this._debouncedSave(providerType);
+        }
+    }
+
+    /**
+     * 将提供商按“类别”熔断并设置冷却期。
+     * @private
+     */
+    _markProviderUnhealthyWithCooldown(providerType, providerConfig, errorMessage, category, cooldownMs) {
+        if (!providerConfig?.uuid) {
+            this._log('error', 'Invalid providerConfig in _markProviderUnhealthyWithCooldown');
+            return;
+        }
+
+        const provider = this._findProvider(providerType, providerConfig.uuid);
+        if (!provider) return;
+
+        const now = Date.now();
+        const ms = Number.isFinite(Number(cooldownMs)) ? Math.max(0, Number(cooldownMs)) : 0;
+        const cooldownUntil = ms > 0 ? new Date(now + ms).toISOString() : null;
+
+        provider.config.errorCount = this.maxErrorCount;
+        provider.config.isHealthy = false;
+        provider.config.lastErrorTime = new Date(now).toISOString();
+        provider.config.lastUsed = new Date(now).toISOString();
+        provider.config.lastErrorCategory = category || null;
+        provider.config.cooldownUntil = cooldownUntil;
+
+        if (errorMessage) {
+            provider.config.lastErrorMessage = errorMessage;
+        }
+
+        const cooldownHint = cooldownUntil ? `, cooldownUntil=${cooldownUntil}` : '';
+        this._log('warn', `已熔断提供商: ${providerConfig.uuid} (${providerType}), category=${category}${cooldownHint}`);
+        this._debouncedSave(providerType);
+    }
+
+    /**
+     * 服务器侧 5xx：快速熔断并进入较短冷却期，优先触发号池切换。
+     */
+    markProviderServerError(providerType, providerConfig, errorMessage = null) {
+        this._markProviderUnhealthyWithCooldown(
+            providerType,
+            providerConfig,
+            errorMessage,
+            'server',
+            this.serverErrorCooldownMs
+        );
+    }
+
+    /**
+     * 确定性失败（payload/格式/参数等）：立即踢出并进入较长冷却期，避免反复选中。
+     */
+    markProviderDeterministicFailure(providerType, providerConfig, errorMessage = null) {
+        this._markProviderUnhealthyWithCooldown(
+            providerType,
+            providerConfig,
+            errorMessage,
+            'deterministic',
+            this.deterministicCooldownMs
+        );
+    }
+
+    /**
      * Marks a provider as healthy.
      * @param {string} providerType - The type of the provider.
      * @param {object} providerConfig - The configuration of the provider to mark.
@@ -438,6 +586,8 @@ export class ProviderPoolManager {
             provider.config.errorCount = 0;
             provider.config.lastErrorTime = null;
             provider.config.lastErrorMessage = null;
+            provider.config.cooldownUntil = null;
+            provider.config.lastErrorCategory = null;
             
             // 更新健康检测信息
             provider.config.lastHealthCheckTime = new Date().toISOString();
@@ -530,10 +680,22 @@ export class ProviderPoolManager {
                 const providerConfig = providerStatus.config;
 
                 // Only attempt to health check unhealthy providers after a certain interval
-                if (!providerStatus.config.isHealthy && providerStatus.config.lastErrorTime &&
-                    (now.getTime() - new Date(providerStatus.config.lastErrorTime).getTime() < this.healthCheckInterval)) {
-                    this._log('debug', `Skipping health check for ${providerConfig.uuid} (${providerType}). Last error too recent.`);
-                    continue;
+                if (!providerStatus.config.isHealthy) {
+                    // 1) 熔断冷却期内直接跳过
+                    if (providerStatus.config.cooldownUntil) {
+                        const untilTs = new Date(providerStatus.config.cooldownUntil).getTime();
+                        if (Number.isFinite(untilTs) && now.getTime() < untilTs) {
+                            this._log('debug', `Skipping health check for ${providerConfig.uuid} (${providerType}). In cooldown until ${providerStatus.config.cooldownUntil}.`);
+                            continue;
+                        }
+                    }
+
+                    // 2) 默认健康检查间隔内也跳过（避免过于频繁探测）
+                    if (providerStatus.config.lastErrorTime &&
+                        (now.getTime() - new Date(providerStatus.config.lastErrorTime).getTime() < this.healthCheckInterval)) {
+                        this._log('debug', `Skipping health check for ${providerConfig.uuid} (${providerType}). Last error too recent.`);
+                        continue;
+                    }
                 }
 
                 try {
