@@ -96,6 +96,415 @@ function getSystemRuntimeInfo() {
 }
 
 // =============================================================================
+// 分层摘要压缩系统 - 支持超长上下文（虚拟 3000k+）
+// =============================================================================
+
+/**
+ * 摘要压缩配置常量
+ */
+const SUMMARY_CONFIG = {
+    // 摘要模型
+    SUMMARY_MODEL: 'claude-haiku-4-5',
+    SUMMARY_MODEL_ID: 'claude-haiku-4.5',
+    // 分层阈值（token 数）
+    TIER1_THRESHOLD: 50_000,   // 近期层：保持完整
+    TIER2_THRESHOLD: 150_000,  // 中期层：详细摘要
+    // 压缩比目标
+    TIER2_COMPRESSION_RATIO: 10,  // 中期层 10:1 压缩
+    TIER3_COMPRESSION_RATIO: 20,  // 远期层 20:1 压缩
+    // 摘要最大 token
+    TIER2_MAX_SUMMARY_TOKENS: 8000,
+    TIER3_MAX_SUMMARY_TOKENS: 4000,
+    // 代码块保留设置
+    MAX_CODE_BLOCKS_TO_KEEP: 10,
+    MAX_CODE_BLOCK_LINES: 50,
+    // 缓存设置
+    CACHE_MAX_SIZE: 100,
+    CACHE_TTL_MS: 30 * 60 * 1000, // 30 分钟
+};
+
+/**
+ * 摘要缓存类 - 基于消息哈希的 LRU 缓存
+ */
+class SummaryCache {
+    constructor(maxSize = SUMMARY_CONFIG.CACHE_MAX_SIZE, ttlMs = SUMMARY_CONFIG.CACHE_TTL_MS) {
+        this.cache = new Map();
+        this.maxSize = maxSize;
+        this.ttlMs = ttlMs;
+    }
+
+    /**
+     * 生成消息数组的哈希键
+     */
+    _generateKey(messages) {
+        const content = messages.map(m => {
+            const text = typeof m.content === 'string' ? m.content :
+                (Array.isArray(m.content) ? m.content.map(c => c.text || c.thinking || '').join('') : '');
+            return `${m.role}:${text.slice(0, 500)}`; // 只取前500字符用于哈希
+        }).join('|');
+        return crypto.createHash('md5').update(content).digest('hex');
+    }
+
+    /**
+     * 获取缓存的摘要
+     */
+    get(messages) {
+        const key = this._generateKey(messages);
+        const entry = this.cache.get(key);
+        if (!entry) return null;
+
+        // 检查是否过期
+        if (Date.now() - entry.timestamp > this.ttlMs) {
+            this.cache.delete(key);
+            return null;
+        }
+
+        // LRU: 移到末尾
+        this.cache.delete(key);
+        this.cache.set(key, entry);
+        return entry.summary;
+    }
+
+    /**
+     * 设置缓存
+     */
+    set(messages, summary) {
+        const key = this._generateKey(messages);
+
+        // 如果超过最大容量，删除最旧的条目
+        if (this.cache.size >= this.maxSize) {
+            const oldestKey = this.cache.keys().next().value;
+            this.cache.delete(oldestKey);
+        }
+
+        this.cache.set(key, {
+            summary,
+            timestamp: Date.now()
+        });
+    }
+
+    /**
+     * 清理过期缓存
+     */
+    cleanup() {
+        const now = Date.now();
+        for (const [key, entry] of this.cache.entries()) {
+            if (now - entry.timestamp > this.ttlMs) {
+                this.cache.delete(key);
+            }
+        }
+    }
+}
+
+// 全局摘要缓存实例
+const summaryCache = new SummaryCache();
+
+/**
+ * 从文本中提取代码块
+ * @param {string} text - 输入文本
+ * @returns {Array<{language: string, code: string, startLine: number}>} 代码块数组
+ */
+function extractCodeBlocks(text) {
+    const codeBlocks = [];
+    // 匹配 markdown 代码块
+    const codeBlockRegex = /```(\w*)\n([\s\S]*?)```/g;
+    let match;
+
+    while ((match = codeBlockRegex.exec(text)) !== null) {
+        const language = match[1] || 'text';
+        const code = match[2];
+        const lines = code.split('\n');
+
+        // 如果代码块太长，只保留前后部分
+        if (lines.length > SUMMARY_CONFIG.MAX_CODE_BLOCK_LINES) {
+            const keepLines = Math.floor(SUMMARY_CONFIG.MAX_CODE_BLOCK_LINES / 2);
+            const truncatedCode = [
+                ...lines.slice(0, keepLines),
+                `\n... [${lines.length - SUMMARY_CONFIG.MAX_CODE_BLOCK_LINES} lines omitted] ...\n`,
+                ...lines.slice(-keepLines)
+            ].join('\n');
+            codeBlocks.push({ language, code: truncatedCode, original: code });
+        } else {
+            codeBlocks.push({ language, code, original: code });
+        }
+    }
+
+    return codeBlocks;
+}
+
+/**
+ * 从消息数组中提取重要的代码块
+ * @param {Array} messages - 消息数组
+ * @returns {string} 格式化的代码块摘要
+ */
+function extractImportantCodeBlocks(messages) {
+    const allCodeBlocks = [];
+
+    for (const msg of messages) {
+        const content = typeof msg.content === 'string' ? msg.content :
+            (Array.isArray(msg.content) ? msg.content.map(c => c.text || '').join('\n') : '');
+
+        const blocks = extractCodeBlocks(content);
+        for (const block of blocks) {
+            allCodeBlocks.push({
+                role: msg.role,
+                ...block
+            });
+        }
+    }
+
+    // 只保留最近的 N 个代码块
+    const recentBlocks = allCodeBlocks.slice(-SUMMARY_CONFIG.MAX_CODE_BLOCKS_TO_KEEP);
+
+    if (recentBlocks.length === 0) return '';
+
+    let result = '\n\n### Key Code Snippets from History:\n';
+    for (const block of recentBlocks) {
+        result += `\n**[${block.role}] ${block.language}:**\n\`\`\`${block.language}\n${block.code}\n\`\`\`\n`;
+    }
+
+    return result;
+}
+
+/**
+ * 将消息数组转换为可读文本（用于摘要生成）
+ * @param {Array} messages - 消息数组
+ * @returns {string} 格式化的对话文本
+ */
+function messagesToText(messages) {
+    return messages.map(msg => {
+        const role = msg.role === 'user' ? 'User' : 'Assistant';
+        let content = '';
+
+        if (typeof msg.content === 'string') {
+            content = msg.content;
+        } else if (Array.isArray(msg.content)) {
+            content = msg.content.map(part => {
+                if (part.type === 'text') return part.text;
+                if (part.type === 'tool_result') return `[Tool Result: ${part.tool_use_id}]\n${typeof part.content === 'string' ? part.content : JSON.stringify(part.content)}`;
+                if (part.type === 'tool_use') return `[Tool Call: ${part.name}]\n${JSON.stringify(part.input)}`;
+                if (part.type === 'thinking') return `[Thinking]\n${part.thinking}`;
+                if (part.type === 'image') return '[Image]';
+                return '';
+            }).filter(Boolean).join('\n');
+        }
+
+        // 限制单条消息长度，避免摘要请求过大
+        if (content.length > 10000) {
+            content = content.slice(0, 5000) + '\n...[content truncated]...\n' + content.slice(-3000);
+        }
+
+        return `### ${role}:\n${content}`;
+    }).join('\n\n---\n\n');
+}
+
+/**
+ * 生成摘要的 prompt 模板
+ */
+function getSummaryPrompt(tier, conversationText, codeBlocks = '') {
+    const basePrompt = `You are a conversation summarizer. Your task is to create a concise but comprehensive summary of the following conversation history.
+
+IMPORTANT GUIDELINES:
+1. Preserve key decisions, conclusions, and action items
+2. Keep track of important file paths, function names, and technical details mentioned
+3. Note any unresolved issues or pending tasks
+4. Mai context about what the user is trying to accomplish
+5. Be concise but don't lose critical information
+
+${tier === 'tier2' ? 'Create a DETAILED summary that captures the main flow of the conversation.' : 'Create a BRIEF summary focusing only on the most critical information and decisions.'}
+
+CONVERSATION TO SUMMARIZE:
+---
+${conversationText}
+---
+${codeBlocks ? `\nIMPORTANT CODE SNIPPETS (preserve these references):\n${codeBlocks}` : ''}
+
+Please provide your summary in the following format:
+
+## Conversation Summary
+
+### Main Topic/Goal:
+[What the user is trying to accomplish]
+
+### Key Decisions & Conclusions:
+- [Decision 1]
+- [Decision 2]
+...
+
+### Important Technical Details:
+- Files: [relevant file paths]
+- Functions/Classes: [important code elements]
+- Commands: [any commands discussed]
+
+### Current Status:
+[Where the conversation left off]
+
+### Pending Items:
+- [Any unresolved issues or next steps]
+
+---
+Summary:`;
+
+    return basePrompt;
+}
+
+/**
+ * 调用 Haiku 模型生成摘要（内部方法，由 KiroApiService 实例调用）
+ * @param {KiroApiService} service - Kiro API 服务实例
+ * @param {string} conversationText - 对话文本
+ * @param {string} tier - 摘要层级 ('tier2' 或 'tier3')
+ * @param {string} codeBlocks - 代码块摘要
+ * @returns {Promise<string>} 生成的摘要
+ */
+async function generateSummaryWithHaiku(service, conversationText, tier, codeBlocks = '') {
+    const prompt = getSummaryPrompt(tier, conversationText, codeBlocks);
+    const maxTokens = tier === 'tier2' ? SUMMARY_CONFIG.TIER2_MAX_SUMMARY_TOKENS : SUMMARY_CONFIG.TIER3_MAX_SUMMARY_TOKENS;
+
+    try {
+        console.log(`[Kiro Summary] Generating ${tier} summary with Haiku...`);
+
+        // 构建简化的请求（不带工具）
+        const summaryRequest = {
+            messages: [
+                { role: 'user', content: [{ type: 'text', text: prompt }] }
+            ],
+            system: null,
+            tools: null,
+            thinking: null
+        };
+
+        // 使用 Haiku 模型调用
+        const response = await service.callApi('POST', SUMMARY_CONFIG.SUMMARY_MODEL, summaryRequest, false, 0);
+        const result = service._processApiResponse(response);
+
+        console.log(`[Kiro Summary] ${tier} summary generated successfully`);
+        return result.responseText || '[Summary generation failed]';
+    } catch (error) {
+        console.error(`[Kiro Summary] Failed to generate ${tier} summary:`, error.message);
+        // 降级：返回简单的截断摘要
+        return `[Auto-summary failed, using truncated history]\n\n${conversationText.slice(0, 2000)}...\n\n[${conversationText.length} characters truncated]`;
+    }
+}
+
+/**
+ * 分层压缩上下文（主函数）
+ * @param {Array} messages - 原始消息数组
+ * @param {string} model - 当前使用的模型
+ * @param {string|null} systemPrompt - 系统提示
+ * @param {Array|null} tools - 工具定义
+ * @param {Object} config - 配置选项
+ * @param {KiroApiService} service - Kiro API 服务实例（用于调用 Haiku）
+ * @returns {Promise<{messages: Array, compressed: boolean, originalTokens: number, compressedTokens: number}>}
+ */
+async function compressContextWithSummary(messages, model, systemPrompt = null, tools = null, config = {}, service = null) {
+    // 配置参数
+    const enableCompression = config.KIRO_ENABLE_CONTEXT_COMPRESSION ?? true;
+    const virtualContextLimit = config.KIRO_VIRTUAL_CONTEXT_LIMIT ?? 3_000_000; // 虚拟上下文限制
+    const tier1Threshold = config.KIRO_TIER1_THRESHOLD ?? SUMMARY_CONFIG.TIER1_THRESHOLD;
+    const tier2Threshold = config.KIRO_TIER2_THRESHOLD ?? SUMMARY_CONFIG.TIER2_THRESHOLD;
+    const keepRecentMessages = config.KIRO_COMPRESSION_KEEP_RECENT ?? 30; // 保留最近30条消息完整
+
+    if (!enableCompression) {
+        return { messages, compressed: false, originalTokens: 0, compressedTokens: 0 };
+    }
+
+    // 估算当前 token 数量
+    const originalTokens = estimateMessagesTokens(messages, systemPrompt, tools);
+    const { maxAllowedSize } = getContextWindowInfo(model);
+
+    console.log(`[Kiro Compression] Original tokens: ${originalTokens}, Max allowed: ${maxAllowedSize}, Virtual limit: ${virtualContextLimit}`);
+
+    // 如果未超过物理限制的 80%，不需要压缩
+    if (originalTokens <= maxAllowedSize * 0.8) {
+        return { messages, compressed: false, originalTokens, compressedTokens: originalTokens };
+    }
+
+    // 如果没有服务实例，无法生成摘要，回退到简单截断
+    if (!service) {
+        console.log('[Kiro Compression] No service instance available, falling back to truncation');
+        return { messages, compressed: false, originalTokens, compressedTokens: originalTokens };
+    }
+
+    console.log(`[Kiro Compression] Starting context compression...`);
+
+    // 深拷贝消息
+    const allMessages = JSON.parse(JSON.stringify(messages));
+
+    // 分离消息层级
+    const recentCount = Math.min(keepRecentMessages, allMessages.length);
+    const recentMessages = allMessages.slice(-recentCount); // 近期层：保持完整
+    const olderMessages = allMessages.slice(0, -recentCount); // 需要压缩的消息
+
+    if (olderMessages.length === 0) {
+        console.log('[Kiro Compression] No older messages to compress');
+        return { messages, compressed: false, originalTokens, compressedTokens: originalTokens };
+    }
+
+    // 检查缓存
+    const cachedSummary = summaryCache.get(olderMessages);
+    let summary;
+
+    if (cachedSummary) {
+        console.log('[Kiro Compression] Using cached summary');
+        summary = cachedSummary;
+    } else {
+        // 估算旧消息的 token 数量来决定压缩层级
+        const olderTokens = estimateMessagesTokens(olderMessages, null, null);
+
+        // 提取重要代码块
+        const codeBlocks = extractImportantCodeBlocks(olderMessages);
+
+        // 转换为文本
+        const conversationText = messagesToText(olderMessages);
+
+        // 根据 token 数量选择压缩层级
+        const tier = olderTokens > tier2Threshold ? 'tier3' : 'tier2';
+        console.log(`[Kiro Compression] Using ${tier} compression for ${olderTokens} tokens`);
+
+        // 生成摘要
+        summary = await generateSummaryWithHaiku(service, conversationText, tier, codeBlocks);
+
+        // 缓存摘要
+        summaryCache.set(olderMessages, summary);
+    }
+
+    // 构建压缩后的消息数组
+    const compressedMessages = [
+        {
+            role: 'user',
+            content: [{
+                type: 'text',
+                text: `[CONVERSATION HISTORY SUMMARY]\n\nThe following is a summary of our earlier conversation. Please use this context to continue our discussion.\n\n${summary}\n\n---\n[END OF SUMMARY - Recent conversation continues below]`
+            }]
+        },
+        {
+            role: 'assistant',
+            content: [{
+                type: 'text',
+                text: 'I understand. I have reviewed the conversation summary and will continue from where we left off, keeping in mind the context, decisions, and pending items mentioned.'
+            }]
+        },
+        ...recentMessages
+    ];
+
+    // 估算压缩后的 token 数量
+    const compressedTokens = estimateMessagesTokens(compressedMessages, systemPrompt, tools);
+
+    console.log(`[Kiro Compression] Compression complete: ${originalTokens} -> ${compressedTokens} tokens (${Math.round((1 - compressedTokens / originalTokens) * 100)}% reduction)`);
+    console.log(`[Kiro Compression] Compressed ${olderMessages.length} messages into summary, kept ${recentMessages.length} recent messages`);
+
+    return {
+        messages: compressedMessages,
+        compressed: true,
+        originalTokens,
+        compressedTokens,
+        summaryLength: summary.length,
+        messagesCompressed: olderMessages.length,
+        messagesKept: recentMessages.length
+    };
+}
+
+// =============================================================================
 // 上下文窗口管理（参考 Cline 的 context-management 策略）
 // =============================================================================
 
@@ -1717,7 +2126,35 @@ export class KiroApiService {
     async callApi(method, model, body, isRetry = false, retryCount = 0) {
         if (!this.isInitialized) await this.initialize();
 
-        const requestData = this.buildCodewhispererRequest(body.messages, model, body.tools, body.system, body.thinking);
+        // === 分层摘要压缩：在构建请求前压缩上下文 ===
+        let processedBody = body;
+        const enableCompression = this.config.KIRO_ENABLE_CONTEXT_COMPRESSION ?? false;
+
+        if (enableCompression && body.messages && body.messages.length > 0) {
+            try {
+                const compressionResult = await compressContextWithSummary(
+                    body.messages,
+                    model,
+                    body.system,
+                    body.tools,
+                    this.config,
+                    this // 传递服务实例用于调用 Haiku
+                );
+
+                if (compressionResult.compressed) {
+                    processedBody = {
+                        ...body,
+                        messages: compressionResult.messages
+                    };
+                    console.log(`[Kiro] Context compressed: ${compressionResult.originalTokens} -> ${compressionResult.compressedTokens} tokens`);
+                }
+            } catch (compressionError) {
+                console.error('[Kiro] Context compression failed, using original messages:', compressionError.message);
+                // 压缩失败时继续使用原始消息
+            }
+        }
+
+        const requestData = this.buildCodewhispererRequest(processedBody.messages, model, processedBody.tools, processedBody.system, processedBody.thinking);
 
         try {
             const token = this.accessToken; // Use the already initialized token
