@@ -3379,9 +3379,19 @@ export class KiroApiService {
             }
         }
 
-        // 如果还有未完成的工具调用，添加到列表中
+        // 如果还有未完成的工具调用，验证 JSON 有效性后再添加
         if (currentToolCallDict) {
-            toolCalls.push(currentToolCallDict);
+            try {
+                const args = currentToolCallDict.function.arguments;
+                if (args && args.trim()) {
+                    JSON.parse(args); // 验证 JSON 有效性
+                    toolCalls.push(currentToolCallDict);
+                } else {
+                    console.warn(`[Kiro] Discarding incomplete tool call "${currentToolCallDict.function.name}": empty arguments`);
+                }
+            } catch (e) {
+                console.warn(`[Kiro] Discarding incomplete tool call "${currentToolCallDict.function.name}": invalid JSON - ${e.message}`, currentToolCallDict.function.arguments);
+            }
         }
 
         // 检查解析后文本中的 bracket 格式工具调用
@@ -4311,22 +4321,32 @@ export class KiroApiService {
             }
 
             if (toolCalls && toolCalls.length > 0) {
-                toolCalls.forEach((tc, index) => {
+                let validToolCallIndex = 0;
+                toolCalls.forEach((tc) => {
                     let inputObject;
                     try {
                         // Arguments should be a stringified JSON object, need to parse it
                         const args = tc.function.arguments;
                         inputObject = typeof args === 'string' ? JSON.parse(args) : args;
                     } catch (e) {
-                        console.warn(`[Kiro] Invalid JSON for tool call arguments. Wrapping in raw_arguments. Error: ${e.message}`, tc.function.arguments);
-                        // If parsing fails, wrap the raw string in an object as a fallback,
-                        // since Claude's `input` field expects an object.
-                        inputObject = { "raw_arguments": tc.function.arguments };
+                        // 尝试使用 repairJson 修复
+                        console.warn(`[Kiro] Invalid JSON for tool call "${tc.function.name}", attempting repair. Error: ${e.message}`);
+                        try {
+                            const repairedArgs = repairJson(tc.function.arguments);
+                            inputObject = JSON.parse(repairedArgs);
+                            console.log(`[Kiro] Successfully repaired JSON for tool call "${tc.function.name}"`);
+                        } catch (e2) {
+                            console.error(`[Kiro] Cannot repair tool call "${tc.function.name}" arguments, skipping. Original: ${tc.function.arguments}`);
+                            return; // 跳过这个无效的工具调用
+                        }
                     }
+
+                    const currentIndex = validToolCallIndex++;
+
                     // 2. content_block_start for each tool_use
                     events.push({
                         type: "content_block_start",
-                        index: index,
+                        index: currentIndex,
                         content_block: {
                             type: "tool_use",
                             id: tc.id,
@@ -4339,7 +4359,7 @@ export class KiroApiService {
                     // Since Kiro is not truly streaming, we send the full arguments as one delta.
                     events.push({
                         type: "content_block_delta",
-                        index: index,
+                        index: currentIndex,
                         delta: {
                             type: "input_json_delta",
                             partial_json: JSON.stringify(inputObject)
@@ -4349,11 +4369,13 @@ export class KiroApiService {
                     // 4. content_block_stop for each tool_use
                     events.push({
                         type: "content_block_stop",
-                        index: index
+                        index: currentIndex
                     });
                     totalOutputTokens += this.countTextTokens(JSON.stringify(inputObject));
                 });
-                stopReason = "tool_use"; // If there are tool calls, the stop reason is tool_use
+                if (validToolCallIndex > 0) {
+                    stopReason = "tool_use"; // If there are valid tool calls, the stop reason is tool_use
+                }
             }
 
             // 5. message_delta with appropriate stop reason
@@ -4394,6 +4416,7 @@ export class KiroApiService {
 
             // 2) 再处理工具调用
             if (toolCalls && toolCalls.length > 0) {
+                let hasValidToolCall = false;
                 for (const tc of toolCalls) {
                     let inputObject;
                     try {
@@ -4401,10 +4424,16 @@ export class KiroApiService {
                         const args = tc.function.arguments;
                         inputObject = typeof args === 'string' ? JSON.parse(args) : args;
                     } catch (e) {
-                        console.warn(`[Kiro] Invalid JSON for tool call arguments. Wrapping in raw_arguments. Error: ${e.message}`, tc.function.arguments);
-                        // If parsing fails, wrap the raw string in an object as a fallback,
-                        // since Claude's `input` field expects an object.
-                        inputObject = { "raw_arguments": tc.function.arguments };
+                        // 尝试使用 repairJson 修复
+                        console.warn(`[Kiro] Invalid JSON for tool call "${tc.function.name}", attempting repair. Error: ${e.message}`);
+                        try {
+                            const repairedArgs = repairJson(tc.function.arguments);
+                            inputObject = JSON.parse(repairedArgs);
+                            console.log(`[Kiro] Successfully repaired JSON for tool call "${tc.function.name}"`);
+                        } catch (e2) {
+                            console.error(`[Kiro] Cannot repair tool call "${tc.function.name}" arguments, skipping. Original: ${tc.function.arguments}`);
+                            continue; // 跳过这个无效的工具调用
+                        }
                     }
                     contentArray.push({
                         type: "tool_use",
@@ -4413,8 +4442,11 @@ export class KiroApiService {
                         input: inputObject
                     });
                     outputTokens += this.countTextTokens(tc.function.arguments);
+                    hasValidToolCall = true;
                 }
-                stopReason = "tool_use"; // Set stop_reason to "tool_use" when toolCalls exist
+                if (hasValidToolCall) {
+                    stopReason = "tool_use"; // Set stop_reason to "tool_use" when valid toolCalls exist
+                }
             } else {
                 stopReason = "end_turn";
             }
