@@ -834,10 +834,22 @@ export class ProviderPoolManager {
             }
         });
 
-        const serviceAdapter = getServiceAdapter(tempConfig);
-        
-        // 获取所有可能的请求格式
+        // 获取所有可能的请求格式（提前获取，避免后续访问 undefined）
         const healthCheckRequests = this._buildHealthCheckRequests(providerType, modelName);
+        
+        // 防御性检查：确保 healthCheckRequests 是有效数组
+        if (!healthCheckRequests || !Array.isArray(healthCheckRequests) || healthCheckRequests.length === 0) {
+            this._log('warn', `No health check requests available for provider type: ${providerType}`);
+            return { success: false, modelName, errorMessage: 'No health check requests configured for this provider type' };
+        }
+
+        let serviceAdapter;
+        try {
+            serviceAdapter = getServiceAdapter(tempConfig);
+        } catch (adapterError) {
+            this._log('error', `Failed to get service adapter for ${providerType}: ${adapterError.message}`);
+            return { success: false, modelName, errorMessage: `Service adapter initialization failed: ${adapterError.message}` };
+        }
         
         // 重试机制：尝试不同的请求格式
         const maxRetries = healthCheckRequests.length;

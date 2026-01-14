@@ -96,41 +96,87 @@ function getSystemRuntimeInfo() {
 }
 
 // =============================================================================
-// 分层摘要压缩系统 - 支持超长上下文（虚拟 3000k+）
+// 基于权重的上下文压缩系统 - 消息分类打分策略
 // =============================================================================
 
 /**
- * 摘要压缩配置常量
+ * 权重压缩配置常量
  */
-const SUMMARY_CONFIG = {
+const WEIGHT_COMPRESSION_CONFIG = {
     // 摘要模型
-    SUMMARY_MODEL: 'claude-haiku-4-5',
-    SUMMARY_MODEL_ID: 'claude-haiku-4.5',
-    // 分层阈值（token 数）
-    TIER1_THRESHOLD: 50_000,   // 近期层：保持完整
-    TIER2_THRESHOLD: 150_000,  // 中期层：详细摘要
-    // 压缩比目标
-    TIER2_COMPRESSION_RATIO: 10,  // 中期层 10:1 压缩
-    TIER3_COMPRESSION_RATIO: 20,  // 远期层 20:1 压缩
-    // 摘要最大 token
-    TIER2_MAX_SUMMARY_TOKENS: 8000,
-    TIER3_MAX_SUMMARY_TOKENS: 4000,
+    SUMMARY_MODEL: 'claude-opus-4-5',
+    SUMMARY_MODEL_ID: 'claude-opus-4.5',
+
+    // 消息分类权重
+    WEIGHTS: {
+        USER_INSTRUCTION: 100,      // 用户指令：最高优先级
+        KEY_STATE: 80,              // 关键状态：代码修改、文件操作、重要决策
+        INTERMEDIATE_REASONING: 40, // 中间推理：查询、分析、思考
+        FAILURE_RECORD: 20          // 失败记录：错误、异常、失败的尝试
+    },
+
+    // 压缩阈值
+    HIGH_SCORE_THRESHOLD: 70,       // 高分阈值：完整保留
+    LOW_SCORE_THRESHOLD: 30,        // 低分阈值：合并摘要
+
+    // 时间加成（越新的消息加分越多）
+    MAX_RECENCY_BONUS: 20,
+
+    // 摘要配置
+    LOW_SCORE_SUMMARY_MAX_TOKENS: 2000,
+
+    // 保留最近 N 条消息不压缩
+    KEEP_RECENT_COUNT: 10,
+
     // 代码块保留设置
     MAX_CODE_BLOCKS_TO_KEEP: 10,
     MAX_CODE_BLOCK_LINES: 50,
+
     // 缓存设置
-    CACHE_MAX_SIZE: 100,
-    CACHE_TTL_MS: 30 * 60 * 1000, // 30 分钟
+    CACHE_MAX_SIZE: 200,              // 增加缓存容量
+    CACHE_TTL_MS: 2 * 60 * 60 * 1000, // 2 小时（延长缓存时间）
 };
+
+// 关键词定义
+const CLASSIFICATION_KEYWORDS = {
+    // 用户指令关键词
+    USER_INSTRUCTION: [
+        '帮我', '请', '修改', '实现', '添加', '删除', '创建', '修复', '优化',
+        '怎么', '如何', '为什么', '什么是', '能不能', '可以',
+        'help', 'please', 'fix', 'add', 'remove', 'create', 'implement',
+        'how', 'what', 'why', 'can you', 'could you', 'would you'
+    ],
+    // 关键状态工具（修改类操作）
+    KEY_STATE_TOOLS: ['Edit', 'Write', 'NotebookEdit', 'Bash', 'TodoWrite'],
+    // 用户确认关键词
+    USER_CONFIRMATION: [
+        '好的', '确认', '同意', '可以', '行', '对', '是的', '没问题',
+        'ok', 'yes', 'sure', 'confirmed', 'agree', 'approved', 'lgtm'
+    ],
+    // 失败关键词
+    FAILURE: [
+        'error', 'failed', 'exception', 'Error', 'Failed', 'Exception',
+        'TypeError', 'SyntaxError', 'ReferenceError', 'cannot', 'unable',
+        '错误', '失败', '异常', '不行', '无法', '报错', '出错'
+    ],
+    // 查询类工具（中间推理）
+    QUERY_TOOLS: ['Read', 'Grep', 'Glob', 'WebFetch', 'WebSearch', 'Task']
+};
+
+// 兼容旧配置名（向后兼容）
+const SUMMARY_CONFIG = WEIGHT_COMPRESSION_CONFIG;
 
 /**
  * 摘要缓存类 - 基于消息哈希的 LRU 缓存
+ * 支持增量缓存：当新消息是旧消息的超集时，可复用部分缓存
  */
 class SummaryCache {
     constructor(maxSize = SUMMARY_CONFIG.CACHE_MAX_SIZE, ttlMs = SUMMARY_CONFIG.CACHE_TTL_MS) {
         this.cache = new Map();
         this.maxSize = maxSize;
         this.ttlMs = ttlMs;
+        this.hits = 0;
+        this.misses = 0;
     }
 
     /**
@@ -146,23 +192,76 @@ class SummaryCache {
     }
 
     /**
+     * 生成消息数组的前缀哈希（用于增量缓存匹配）
+     */
+    _generatePrefixKeys(messages) {
+        const keys = [];
+        // 生成不同长度前缀的哈希，用于部分匹配
+        const checkpoints = [
+            Math.floor(messages.length * 0.5),
+            Math.floor(messages.length * 0.7),
+            Math.floor(messages.length * 0.9)
+        ].filter(n => n > 0);
+
+        for (const len of checkpoints) {
+            const prefix = messages.slice(0, len);
+            keys.push({
+                key: this._generateKey(prefix),
+                length: len
+            });
+        }
+        return keys;
+    }
+
+    /**
      * 获取缓存的摘要
      */
     get(messages) {
         const key = this._generateKey(messages);
         const entry = this.cache.get(key);
-        if (!entry) return null;
 
-        // 检查是否过期
-        if (Date.now() - entry.timestamp > this.ttlMs) {
+        if (entry && Date.now() - entry.timestamp <= this.ttlMs) {
+            // 完全匹配
             this.cache.delete(key);
-            return null;
+          this.cache.set(key, entry);
+            this.hits++;
+            console.log(`[Kiro Cache] Hit (exact match), total hits: ${this.hits}, misses: ${this.misses}`);
+            return entry.summary;
         }
 
-        // LRU: 移到末尾
-        this.cache.delete(key);
-        this.cache.set(key, entry);
-        return entry.summary;
+        if (entry) {
+            this.cache.delete(key); // 过期，删除
+        }
+
+        this.misses++;
+        return null;
+    }
+
+    /**
+     * 获取部分匹配的缓存（增量缓存）
+     * 返回最长匹配的前缀摘要和未覆盖的消息
+     */
+    getPartial(messages) {
+        const prefixKeys = this._generatePrefixKeys(messages);
+
+        // 从长到短查找匹配
+        for (let i = prefixKeys.length - 1; i >= 0; i--) {
+            const { key, length } = prefixKeys[i];
+            const entry = this.cache.get(key);
+
+            if (entry && Date.now() - entry.timestamp <= this.ttlMs) {
+                // 找到部分匹配
+                this.hits++;
+                console.log(`[Kiro Cache] Partial hit (${length}/${messages.length} messages), total hits: ${this.hits}`);
+                return {
+                    summary: entry.summary,
+                    coveredLength: length,
+                    uncoveredMessages: messages.slice(length)
+                };
+            }
+        }
+
+        return null;
     }
 
     /**
@@ -179,8 +278,11 @@ class SummaryCache {
 
         this.cache.set(key, {
             summary,
-            timestamp: Date.now()
+            timestamp: Date.now(),
+            messageCount: messages.length
         });
+
+        console.log(`[Kiro Cache] Stored summary for ${messages.length} messages, cache size: ${this.cache.size}`);
     }
 
     /**
@@ -188,16 +290,364 @@ class SummaryCache {
      */
     cleanup() {
         const now = Date.now();
+        let cleaned = 0;
         for (const [key, entry] of this.cache.entries()) {
             if (now - entry.timestamp > this.ttlMs) {
                 this.cache.delete(key);
+                cleaned++;
             }
         }
+        if (cleaned > 0) {
+            console.log(`[Kiro Cache] Cleaned ${cleaned} expired entries`);
+        }
+    }
+
+    /**
+     * 获取缓存统计信息
+     */
+    getStats() {
+        return {
+            size: this.cache.size,
+            maxSize: this.maxSize,
+            hits: this.hits,
+            misses: this.misses,
+            hitRate: this.hits + this.misses > 0
+                ? Math.round(this.hits / (this.hits + this.misses) * 100)
+                : 0
+        };
     }
 }
 
 // 全局摘要缓存实例
 const summaryCache = new SummaryCache();
+
+// =============================================================================
+// 消息分类与打分系统
+// =============================================================================
+
+/**
+ * 提取消息的文本内容
+ * @param {Object} message - 消息对象
+ * @returns {string} 文本内容
+ */
+function extractMessageText(message) {
+    if (typeof message.content === 'string') {
+        return message.content;
+    }
+    if (Array.isArray(message.content)) {
+        return message.content.map(part => {
+            if (part.type === 'text') return part.text || '';
+            if (part.type === 'thinking') return part.thinking || '';
+            if (part.type === 'tool_result') {
+                return typeof part.content === 'string' ? part.content : JSON.stringify(part.content || '');
+            }
+            if (part.type === 'tool_use') return `[Tool: ${part.name}]`;
+            return '';
+        }).join('\n');
+    }
+    return '';
+}
+
+/**
+ * 检测消息中包含的工具调用
+ * @param {Object} message - 消息对象
+ * @returns {Array<string>} 工具名称列表
+ */
+function extractToolNames(message) {
+    const tools = [];
+    if (Array.isArray(message.content)) {
+        for (const part of message.content) {
+            if (part.type === 'tool_use' && part.name) {
+                tools.push(part.name);
+            }
+            if (part.type === 'tool_result' && part.tool_use_id) {
+                // tool_result 不直接包含工具名，但可以标记为有工具结果
+                tools.push('__tool_result__');
+            }
+        }
+    }
+    return tools;
+}
+
+/**
+ * 检查文本是否包含关键词
+ * @param {string} text - 文本内容
+ * @param {Array<string>} keywords - 关键词列表
+ * @returns {boolean}
+ */
+function containsKeywords(text, keywords) {
+    const lowerText = text.toLowerCase();
+    return keywords.some(kw => lowerText.includes(kw.toLowerCase()));
+}
+
+/**
+ * 消息分类枚举
+ */
+const MessageCategory = {
+    USER_INSTRUCTION: 'USER_INSTRUCTION',
+    KEY_STATE: 'KEY_STATE',
+    INTERMEDIATE_REASONING: 'INTERMEDIATE_REASONING',
+    FAILURE_RECORD: 'FAILURE_RECORD'
+};
+
+/**
+ * 对单条消息进行分类
+ * @param {Object} message - 消息对象
+ * @param {number} index - 消息索引
+ * @param {number} totalMessages - 消息总数
+ * @param {Object} config - 配置对象
+ * @returns {{category: string, baseScore: number, reason: string}}
+ */
+function classifyMessage(message, index, totalMessages, config = {}) {
+    const weights = config.WEIGHTS || WEIGHT_COMPRESSION_CONFIG.WEIGHTS;
+    const text = extractMessageText(message);
+    const tools = extractToolNames(message);
+    const role = message.role;
+
+    // 1. 检查是否为失败记录（优先级最高，因为失败需要被识别出来）
+    if (containsKeywords(text, CLASSIFICATION_KEYWORDS.FAILURE)) {
+        return {
+            category: MessageCategory.FAILURE_RECORD,
+            baseScore: weights.FAILURE_RECORD,
+            reason: '包含错误/失败关键词'
+        };
+    }
+
+    // 2. 检查是否为用户指令
+    if (role === 'user') {
+        // 排除纯工具结果的用户消息
+        const hasOnlyToolResult = message.content &&
+            Array.isArray(message.content) &&
+            message.content.every(p => p.type === 'tool_result');
+
+        if (!hasOnlyToolResult) {
+            // 检查是否包含指令关键词或是问句
+            if (containsKeywords(text, CLASSIFICATION_KEYWORDS.USER_INSTRUCTION) ||
+                text.includes('?') || text.includes('？')) {
+                return {
+                    category: MessageCategory.USER_INSTRUCTION,
+                    baseScore: weights.USER_INSTRUCTION,
+                    reason: '用户指令/问题'
+                };
+            }
+            // 检查是否为用户确认
+            if (containsKeywords(text, CLASSIFICATION_KEYWORDS.USER_CONFIRMATION)) {
+                return {
+                    category: MessageCategory.KEY_STATE,
+                    baseScore: weights.KEY_STATE,
+                    reason: '用户确认/决策'
+                };
+            }
+        }
+    }
+
+    // 3. 检查是否为关键状态（包含修改类工具）
+    const hasKeyStateTool = tools.some(t =>
+        CLASSIFICATION_KEYWORDS.KEY_STATE_TOOLS.includes(t)
+    );
+    if (hasKeyStateTool) {
+        return {
+            category: MessageCategory.KEY_STATE,
+            baseScore: weights.KEY_STATE,
+            reason: `包含关键工具: ${tools.filter(t => CLASSIFICATION_KEYWORDS.KEY_STATE_TOOLS.includes(t)).join(', ')}`
+        };
+    }
+
+    // 4. 检查是否为查询类操作（中间推理）
+    const hasQueryTool = tools.some(t =>
+        CLASSIFICATION_KEYWORDS.QUERY_TOOLS.includes(t)
+    );
+    if (hasQueryTool || tools.includes('__tool_result__')) {
+        return {
+            category: MessageCategory.INTERMEDIATE_REASONING,
+            baseScore: weights.INTERMEDIATE_REASONING,
+            reason: '查询/分析操作'
+        };
+    }
+
+    // 5. 默认分类
+    if (role === 'user') {
+        // 用户消息默认为指令（可能是简短的指令）
+        return {
+            category: MessageCategory.USER_INSTRUCTION,
+            baseScore: weights.USER_INSTRUCTION * 0.8, // 稍低一点
+            reason: '用户消息（默认）'
+        };
+    }
+
+    // AI 回复默认为中间推理
+    return {
+        category: MessageCategory.INTERMEDIATE_REASONING,
+        baseScore: weights.INTERMEDIATE_REASONING,
+        reason: 'AI 回复（默认）'
+    };
+}
+
+/**
+ * 对消息数组进行批量分类打分
+ * @param {Array} messages - 消息数组
+ * @param {Object} config - 配置对象
+ * @returns {Array<{message: Object, category: string, baseScore: number, finalScore: number, reason: string, index: number}>}
+ */
+function scoreMessages(messages, config = {}) {
+    const maxRecencyBonus = config.MAX_RECENCY_BONUS || WEIGHT_COMPRESSION_CONFIG.MAX_RECENCY_BONUS;
+    const totalMessages = messages.length;
+
+    return messages.map((message, index) => {
+        const classification = classifyMessage(message, index, totalMessages, config);
+
+        // 计算时间加成：越新的消息加分越多
+        const recencyRatio = totalMessages > 1 ? index / (totalMessages - 1) : 1;
+        const recencyBonus = recencyRatio * maxRecencyBonus;
+
+        const finalScore = classification.baseScore + recencyBonus;
+
+        return {
+            message,
+            index,
+            category: classification.category,
+            baseScore: classification.baseScore,
+            recencyBonus: Math.round(recencyBonus * 10) / 10,
+            finalScore: Math.round(finalScore * 10) / 10,
+            reason: classification.reason
+        };
+    });
+}
+
+/**
+ * 按分数分组消息
+ * @param {Array} scoredMessages - 打分后的消息数组
+ * @param {Object} config - 配置对象
+ * @returns {{highScore: Array, lowScore: Array}}
+ */
+function groupMessagesByScore(scoredMessages, config = {}) {
+    const highThreshold = config.HIGH_SCORE_THRESHOLD || WEIGHT_COMPRESSION_CONFIG.HIGH_SCORE_THRESHOLD;
+
+    const highScore = [];
+    const lowScore = [];
+
+    for (const scored of scoredMessages) {
+        if (scored.finalScore >= highThreshold) {
+            highScore.push(scored);
+        } else {
+            lowScore.push(scored);
+        }
+    }
+
+    return { highScore, lowScore };
+}
+
+/**
+ * 格式化低分消息用于摘要生成
+ * @param {Array} lowScoreMessages - 低分消息数组
+ * @returns {string}
+ */
+function formatLowScoreMessagesForSummary(lowScoreMessages) {
+    if (lowScoreMessages.length === 0) return '';
+
+    // 按类别分组
+    const byCategory = {
+        [MessageCategory.INTERMEDIATE_REASONING]: [],
+        [MessageCategory.FAILURE_RECORD]: []
+    };
+
+    for (const scored of lowScoreMessages) {
+        if (byCategory[scored.category]) {
+            byCategory[scored.category].push(scored);
+        } else {
+            byCategory[MessageCategory.INTERMEDIATE_REASONING].push(scored);
+        }
+    }
+
+    let result = '';
+
+    // 中间推理
+    if (byCategory[MessageCategory.INTERMEDIATE_REASONING].length > 0) {
+        result += `\n### 中间推理过程 (${byCategory[MessageCategory.INTERMEDIATE_REASONING].length} 条):\n`;
+        for (const scored of byCategory[MessageCategory.INTERMEDIATE_REASONING].slice(0, 20)) {
+            const text = extractMessageText(scored.message);
+            const truncated = text.length > 500 ? text.slice(0, 500) + '...' : text;
+            result += `- [${scored.message.role}] ${truncated}\n`;
+        }
+        if (byCategory[MessageCategory.INTERMEDIATE_REASONING].length > 20) {
+            result += `... 还有 ${byCategory[MessageCategory.INTERMEDIATE_REASONING].length - 20} 条消息省略\n`;
+        }
+    }
+
+    // 失败记录
+    if (byCategory[MessageCategory.FAILURE_RECORD].length > 0) {
+        result += `\n### 失败记录 (${byCategory[MessageCategory.FAILURE_RECORD].length} 条):\n`;
+        for (const scored of byCategory[MessageCategory.FAILURE_RECORD].slice(0, 10)) {
+            const text = extractMessageText(scored.message);
+            const truncated = text.length > 300 ? text.slice(0, 300) + '...' : text;
+            result += `- [${scored.message.role}] ${truncated}\n`;
+        }
+    }
+
+    return result;
+}
+
+/**
+ * 生成低分消息的统一摘要
+ * @param {Array} lowScoreMessages - 低分消息数组
+ * @param {Object} service - Kiro API 服务实例
+ * @param {Object} config - 配置对象
+ * @returns {Promise<string>}
+ */
+async function generateLowScoreSummary(lowScoreMessages, service, config = {}) {
+    if (lowScoreMessages.length === 0) {
+        return '';
+    }
+
+    const formattedContent = formatLowScoreMessagesForSummary(lowScoreMessages);
+
+    // 统计各类别数量
+    const stats = {
+        intermediate: lowScoreMessages.filter(m => m.category === MessageCategory.INTERMEDIATE_REASONING).length,
+        failure: lowScoreMessages.filter(m => m.category === MessageCategory.FAILURE_RECORD).length
+    };
+
+    const prompt = `你是一个对话摘要助手。请为以下对话片段生成简短摘要（不超过500字）。
+
+这些是对话中的次要内容，包括：
+- 中间推理过程：${stats.intermediate} 条（查询、分析、思考过程）
+- 失败记录：${stats.failure} 条（错误、异常、失败的尝试）
+
+请提取关键信息点，忽略重复和冗余内容。重点关注：
+1. 尝试过但失败的方案（避免重复）
+2. 重要的中间发现
+3. 关键的文件/代码位置信息
+
+内容如下：
+${formattedContent}
+
+请用简洁的要点形式输出摘要：`;
+
+    try {
+        const maxTokens = config.LOW_SCORE_SUMMARY_MAX_TOKENS || WEIGHT_COMPRESSION_CONFIG.LOW_SCORE_SUMMARY_MAX_TOKENS;
+
+        const summaryRequest = {
+            model: WEIGHT_COMPRESSION_CONFIG.SUMMARY_MODEL_ID,
+            max_tokens: maxTokens,
+            messages: [{ role: 'user', content: prompt }]
+        };
+
+        console.log(`[Kiro Weight Compression] Generating summary for ${lowScoreMessages.length} low-score messages...`);
+        const response = await service.callApi('POST', WEIGHT_COMPRESSION_CONFIG.SUMMARY_MODEL, summaryRequest, false, 0);
+        const result = service.parseApiResponse(response);
+
+        console.log(`[Kiro Weight Compression] Low-score summary generated successfully`);
+        return result.responseText || '[摘要生成失败]';
+    } catch (error) {
+        console.error(`[Kiro Weight Compression] Failed to generate summary:`, error.message);
+        // 降级：返回简单的统计信息
+        return `[自动摘要失败]\n- 中间推理: ${stats.intermediate} 条\n- 失败记录: ${stats.failure} 条\n请参考最近的对话上下文继续。`;
+    }
+}
+
+// =============================================================================
+// 代码块提取函数
+// =============================================================================
 
 /**
  * 从文本中提取代码块
@@ -349,19 +799,37 @@ Summary:`;
 }
 
 /**
- * 调用 Haiku 模型生成摘要（内部方法，由 KiroApiService 实例调用）
+ * 调用 Opus 4.5 模型生成摘要（内部方法，由 KiroApiService 实例调用）
  * @param {KiroApiService} service - Kiro API 服务实例
  * @param {string} conversationText - 对话文本
  * @param {string} tier - 摘要层级 ('tier2' 或 'tier3')
  * @param {string} codeBlocks - 代码块摘要
  * @returns {Promise<string>} 生成的摘要
  */
-async function generateSummaryWithHaiku(service, conversationText, tier, codeBlocks = '') {
-    const prompt = getSummaryPrompt(tier, conversationText, codeBlocks);
+async function generateSummaryWithOpus(service, conversationText, tier, codeBlocks = '') {
+    // 限制发送给摘要模型的内容大小（预留空间给 prompt 和输出）
+    // Opus 4.5 上下文 200k，预留 50k 给 prompt 模板和输出
+    const MAX_SUMMARY_INPUT_CHARS = 150_000 * 4; // 约 150k tokens
+
+    let truncatedText = conversationText;
+    let wasTruncated = false;
+
+    if (conversationText.length > MAX_SUMMARY_INPUT_CHARS) {
+        // 保留开头和结尾部分，中间截断
+        const keepChars = Math.floor(MAX_SUMMARY_INPUT_CHARS / 2);
+        const startPart = conversationText.slice(0, keepChars);
+        const endPart = conversationText.slice(-keepChars);
+        const omittedChars = conversationText.length - MAX_SUMMARY_INPUT_CHARS;
+        truncatedText = `${startPart}\n\n[... ${omittedChars.toLocaleString()} characters omitted for summarization ...]\n\n${endPart}`;
+        wasTruncated = true;
+        console.log(`[Kiro Summary] Input truncated: ${conversationText.length} -> ${truncatedText.length} chars`);
+    }
+
+    const prompt = getSummaryPrompt(tier, truncatedText, codeBlocks);
     const maxTokens = tier === 'tier2' ? SUMMARY_CONFIG.TIER2_MAX_SUMMARY_TOKENS : SUMMARY_CONFIG.TIER3_MAX_SUMMARY_TOKENS;
 
     try {
-        console.log(`[Kiro Summary] Generating ${tier} summary with Haiku...`);
+        console.log(`[Kiro Summary] Generating ${tier} summary with Opus 4.5...`);
 
         // 构建简化的请求（不带工具）
         const summaryRequest = {
@@ -373,7 +841,7 @@ async function generateSummaryWithHaiku(service, conversationText, tier, codeBlo
             thinking: null
         };
 
-        // 使用 Haiku 模型调用
+        // 使用 Opus 4.5 模型调用
         const response = await service.callApi('POST', SUMMARY_CONFIG.SUMMARY_MODEL, summaryRequest, false, 0);
         const result = service._processApiResponse(response);
 
@@ -386,122 +854,224 @@ async function generateSummaryWithHaiku(service, conversationText, tier, codeBlo
     }
 }
 
+// 手动压缩指令关键词
+const MANUAL_COMPRESSION_KEYWORDS = [
+    'compact',
+    '/compact',
+    '压缩上下文',
+    '压缩对话',
+    '/compress'
+];
+
 /**
- * 分层压缩上下文（主函数）
+ * 检测消息是否包含手动压缩指令
+ * @param {Array} messages - 消息数组
+ * @returns {boolean}
+ */
+function detectManualCompressionCommand(messages) {
+    if (!messages || messages.length === 0) return false;
+
+    // 检查最后一条用户消息
+    const lastMessage = messages[messages.length - 1];
+    if (lastMessage.role !== 'user') return false;
+
+    const text = extractMessageText(lastMessage).trim().toLowerCase();
+
+    // 检查是否匹配手动压缩关键词
+    return MANUAL_COMPRESSION_KEYWORDS.some(keyword =>
+        text === keyword.toLowerCase() ||
+        text.startsWith(keyword.toLowerCase() + ' ') ||
+        text.startsWith(keyword.toLowerCase() + '\n')
+    );
+}
+
+/**
+ * 基于权重的上下文压缩（主函数）
+ * 将消息分为4类：用户指令、关键状态、中间推理、失败记录
+ * 高分消息完整保留，低分消息合并生成统一摘要
+ *
  * @param {Array} messages - 原始消息数组
  * @param {string} model - 当前使用的模型
  * @param {string|null} systemPrompt - 系统提示
  * @param {Array|null} tools - 工具定义
  * @param {Object} config - 配置选项
- * @param {KiroApiService} service - Kiro API 服务实例（用于调用 Haiku）
- * @returns {Promise<{messages: Array, compressed: boolean, originalTokens: number, compressedTokens: number}>}
+ * @param {KiroApiService} service - Kiro API 服务实例（用于调用 Opus 4.5）
+ * @param {boolean} forceCompress - 强制压缩（手动触发时为 true）
+ * @returns {Promise<{messages: Array, compressed: boolean, originalTokens: number, compressedTokens: number, manualTriggered: boolean}>}
  */
-async function compressContextWithSummary(messages, model, systemPrompt = null, tools = null, config = {}, service = null) {
+async function compressContextByWeight(messages, model, systemPrompt = null, tools = null, config = {}, service = null, forceCompress = false) {
     // 配置参数
     const enableCompression = config.KIRO_ENABLE_CONTEXT_COMPRESSION ?? true;
-    const virtualContextLimit = config.KIRO_VIRTUAL_CONTEXT_LIMIT ?? 3_000_000; // 虚拟上下文限制
-    const tier1Threshold = config.KIRO_TIER1_THRESHOLD ?? SUMMARY_CONFIG.TIER1_THRESHOLD;
-    const tier2Threshold = config.KIRO_TIER2_THRESHOLD ?? SUMMARY_CONFIG.TIER2_THRESHOLD;
-    const keepRecentMessages = config.KIRO_COMPRESSION_KEEP_RECENT ?? 30; // 保留最近30条消息完整
+    const keepRecentCount = config.KIRO_KEEP_RECENT_COUNT ?? WEIGHT_COMPRESSION_CONFIG.KEEP_RECENT_COUNT;
+    const highScoreThreshold = config.KIRO_HIGH_SCORE_THRESHOLD ?? WEIGHT_COMPRESSION_CONFIG.HIGH_SCORE_THRESHOLD;
 
-    if (!enableCompression) {
-        return { messages, compressed: false, originalTokens: 0, compressedTokens: 0 };
+    // 自定义权重配置
+    const weights = {
+        USER_INSTRUCTION: config.KIRO_WEIGHT_USER_INSTRUCTION ?? WEIGHT_COMPRESSION_CONFIG.WEIGHTS.USER_INSTRUCTION,
+        KEY_STATE: config.KIRO_WEIGHT_KEY_STATE ?? WEIGHT_COMPRESSION_CONFIG.WEIGHTS.KEY_STATE,
+        INTERMEDIATE_REASONING: config.KIRO_WEIGHT_INTERMEDIATE ?? WEIGHT_COMPRESSION_CONFIG.WEIGHTS.INTERMEDIATE_REASONING,
+        FAILURE_RECORD: config.KIRO_WEIGHT_FAILURE ?? WEIGHT_COMPRESSION_CONFIG.WEIGHTS.FAILURE_RECORD
+    };
+
+    const compressionConfig = {
+        ...WEIGHT_COMPRESSION_CONFIG,
+        WEIGHTS: weights,
+        HIGH_SCORE_THRESHOLD: highScoreThreshold,
+        KEEP_RECENT_COUNT: keepRecentCount
+    };
+
+    if (!enableCompression && !forceCompress) {
+        return { messages, compressed: false, originalTokens: 0, compressedTokens: 0, manualTriggered: false };
     }
 
     // 估算当前 token 数量
     const originalTokens = estimateMessagesTokens(messages, systemPrompt, tools);
     const { maxAllowedSize } = getContextWindowInfo(model);
 
-    console.log(`[Kiro Compression] Original tokens: ${originalTokens}, Max allowed: ${maxAllowedSize}, Virtual limit: ${virtualContextLimit}`);
+    console.log(`[Kiro Weight Compression] Original tokens: ${originalTokens}, Max allowed: ${maxAllowedSize}, Force: ${forceCompress}`);
 
-    // 如果未超过物理限制的 80%，不需要压缩
-    if (originalTokens <= maxAllowedSize * 0.8) {
-        return { messages, compressed: false, originalTokens, compressedTokens: originalTokens };
+    // 如果未超过物理限制的 80% 且非强制压缩，不需要压缩
+    if (!forceCompress && originalTokens <= maxAllowedSize * 0.8) {
+        return { messages, compressed: false, originalTokens, compressedTokens: originalTokens, manualTriggered: false };
     }
 
     // 如果没有服务实例，无法生成摘要，回退到简单截断
     if (!service) {
-        console.log('[Kiro Compression] No service instance available, falling back to truncation');
-        return { messages, compressed: false, originalTokens, compressedTokens: originalTokens };
+        console.log('[Kiro Weight Compression] No service instance available, falling back to truncation');
+        return { messages, compressed: false, originalTokens, compressedTokens: originalTokens, manualTriggered: forceCompress };
     }
 
-    console.log(`[Kiro Compression] Starting context compression...`);
+    console.log(`[Kiro Weight Compression] Starting weight-based context compression...${forceCompress ? ' (Manual trigger)' : ''}`);
 
     // 深拷贝消息
     const allMessages = JSON.parse(JSON.stringify(messages));
 
-    // 分离消息层级
-    const recentCount = Math.min(keepRecentMessages, allMessages.length);
-    const recentMessages = allMessages.slice(-recentCount); // 近期层：保持完整
-    const olderMessages = allMessages.slice(0, -recentCount); // 需要压缩的消息
+    // 如果是手动触发，移除压缩指令消息
+    let messagesToProcess = allMessages;
+    if (forceCompress && allMessages.length > 0) {
+        const lastMsg = allMessages[allMessages.length - 1];
+        if (lastMsg.role === 'user') {
+            const text = extractMessageText(lastMsg).trim().toLowerCase();
+            if (MANUAL_COMPRESSION_KEYWORDS.some(kw => text === kw.toLowerCase() || text.startsWith(kw.toLowerCase()))) {
+                messagesToProcess = allMessages.slice(0, -1); // 移除压缩指令
+                console.log('[Kiro Weight Compression] Removed manual compression command from messages');
+            }
+        }
+    }
+
+    // 分离最近消息（始终保留）
+    const recentCount = Math.min(keepRecentCount, messagesToProcess.length);
+    const recentMessages = messagesToProcess.slice(-recentCount);
+    const olderMessages = messagesToProcess.slice(0, -recentCount);
 
     if (olderMessages.length === 0) {
-        console.log('[Kiro Compression] No older messages to compress');
+        console.log('[Kiro Weight Compression] No older messages to compress');
         return { messages, compressed: false, originalTokens, compressedTokens: originalTokens };
     }
 
+    // 对旧消息进行分类打分
+    const scoredMessages = scoreMessages(olderMessages, compressionConfig);
+
+    // 按分数分组
+    const { highScore, lowScore } = groupMessagesByScore(scoredMessages, compressionConfig);
+
+    console.log(`[Kiro Weight Compression] Classification results:`);
+    console.log(`  - High score (>= ${highScoreThreshold}): ${highScore.length} messages`);
+    console.log(`  - Low score (< ${highScoreThreshold}): ${lowScore.length} messages`);
+
+    // 打印分类详情（调试用）
+    const categoryStats = {
+        USER_INSTRUCTION: scoredMessages.filter(m => m.category === MessageCategory.USER_INSTRUCTION).length,
+        KEY_STATE: scoredMessages.filter(m => m.category === MessageCategory.KEY_STATE).length,
+        INTERMEDIATE_REASONING: scoredMessages.filter(m => m.category === MessageCategory.INTERMEDIATE_REASONING).length,
+        FAILURE_RECORD: scoredMessages.filter(m => m.category === MessageCategory.FAILURE_RECORD).length
+    };
+    console.log(`[Kiro Weight Compression] Category breakdown:`, categoryStats);
+
     // 检查缓存
-    const cachedSummary = summaryCache.get(olderMessages);
-    let summary;
+    const cacheKey = lowScore.map(s => s.index).join(',');
+    const cachedSummary = summaryCache.get(lowScore.map(s => s.message));
+    let lowScoreSummary;
 
     if (cachedSummary) {
-        console.log('[Kiro Compression] Using cached summary');
-        summary = cachedSummary;
-    } else {
-        // 估算旧消息的 token 数量来决定压缩层级
-        const olderTokens = estimateMessagesTokens(olderMessages, null, null);
-
-        // 提取重要代码块
-        const codeBlocks = extractImportantCodeBlocks(olderMessages);
-
-        // 转换为文本
-        const conversationText = messagesToText(olderMessages);
-
-        // 根据 token 数量选择压缩层级
-        const tier = olderTokens > tier2Threshold ? 'tier3' : 'tier2';
-        console.log(`[Kiro Compression] Using ${tier} compression for ${olderTokens} tokens`);
-
-        // 生成摘要
-        summary = await generateSummaryWithHaiku(service, conversationText, tier, codeBlocks);
-
+        console.log('[Kiro Weight Compression] Using cached summary for low-score messages');
+        lowScoreSummary = cachedSummary;
+    } else if (lowScore.length > 0) {
+        // 为低分消息生成统一摘要
+        lowScoreSummary = await generateLowScoreSummary(lowScore, service, compressionConfig);
         // 缓存摘要
-        summaryCache.set(olderMessages, summary);
+        summaryCache.set(lowScore.map(s => s.message), lowScoreSummary);
+    } else {
+        lowScoreSummary = '';
     }
 
     // 构建压缩后的消息数组
-    const compressedMessages = [
-        {
+    const compressedMessages = [];
+
+    // 1. 添加低分消息摘要（如果有）
+    if (lowScoreSummary) {
+        compressedMessages.push({
             role: 'user',
             content: [{
                 type: 'text',
-                text: `[CONVERSATION HISTORY SUMMARY]\n\nThe following is a summary of our earlier conversation. Please use this context to continue our discussion.\n\n${summary}\n\n---\n[END OF SUMMARY - Recent conversation continues below]`
+                text: `[COMPRESSED CONTEXT SUMMARY]\n\n以下是之前对话中次要内容的摘要（中间推理过程和失败记录）：\n\n${lowScoreSummary}\n\n---\n[END OF SUMMARY]`
             }]
-        },
-        {
+        });
+        compressedMessages.push({
             role: 'assistant',
             content: [{
                 type: 'text',
-                text: 'I understand. I have reviewed the conversation summary and will continue from where we left off, keeping in mind the context, decisions, and pending items mentioned.'
+                text: '我已了解之前的上下文摘要，将继续处理。'
             }]
-        },
-        ...recentMessages
-    ];
+        });
+    }
+
+    // 2. 添加高分消息（按原始顺序）
+    const sortedHighScore = highScore.sort((a, b) => a.index - b.index);
+    for (const scored of sortedHighScore) {
+        compressedMessages.push(scored.message);
+    }
+
+    // 3. 添加最近消息
+    compressedMessages.push(...recentMessages);
 
     // 估算压缩后的 token 数量
     const compressedTokens = estimateMessagesTokens(compressedMessages, systemPrompt, tools);
+    const reductionPercent = Math.round((1 - compressedTokens / originalTokens) * 100);
 
-    console.log(`[Kiro Compression] Compression complete: ${originalTokens} -> ${compressedTokens} tokens (${Math.round((1 - compressedTokens / originalTokens) * 100)}% reduction)`);
-    console.log(`[Kiro Compression] Compressed ${olderMessages.length} messages into summary, kept ${recentMessages.length} recent messages`);
+    console.log(`[Kiro Weight Compression] Compression complete: ${originalTokens} -> ${compressedTokens} tokens (${reductionPercent}% reduction)`);
+    console.log(`[Kiro Weight Compression] Kept ${highScore.length} high-score + ${recentMessages.length} recent messages, summarized ${lowScore.length} low-score messages`);
 
     return {
         messages: compressedMessages,
         compressed: true,
         originalTokens,
         compressedTokens,
-        summaryLength: summary.length,
-        messagesCompressed: olderMessages.length,
-        messagesKept: recentMessages.length
+        manualTriggered: forceCompress,
+        stats: {
+            highScoreKept: highScore.length,
+            lowScoreSummarized: lowScore.length,
+            recentKept: recentMessages.length,
+            categoryStats,
+            reductionPercent
+        }
     };
+}
+
+/**
+ * 分层压缩上下文（旧函数，保留向后兼容）
+ * @deprecated 请使用 compressContextByWeight
+ * @param {Array} messages - 原始消息数组
+ * @param {string} model - 当前使用的模型
+ * @param {string|null} systemPrompt - 系统提示
+ * @param {Array|null} tools - 工具定义
+ * @param {Object} config - 配置选项
+ * @param {KiroApiService - Kiro API 服务实例（用于调用 Opus 4.5）
+ * @returns {Promise<{messages: Array, compressed: boolean, originalTokens: number, compressedTokens: number}>}
+ */
+async function compressContextWithSummary(messages, model, systemPrompt = null, tools = null, config = {}, service = null) {
+    // 直接调用新的基于权重的压缩函数
+    return compressContextByWeight(messages, model, systemPrompt, tools, config, service);
 }
 
 // =============================================================================
@@ -2126,19 +2696,28 @@ export class KiroApiService {
     async callApi(method, model, body, isRetry = false, retryCount = 0) {
         if (!this.isInitialized) await this.initialize();
 
-        // === 分层摘要压缩：在构建请求前压缩上下文 ===
+        // === 基于权重的上下文压缩：在构建请求前压缩上下文 ===
         let processedBody = body;
-        const enableCompression = this.config.KIRO_ENABLE_CONTEXT_COMPRESSION ?? false;
+        const enableCompression = this.config.KIRO_ENABLE_CONTEXT_COMPRESSION ?? true;
 
-        if (enableCompression && body.messages && body.messages.length > 0) {
+        // 检测是否为手动压缩指令
+        const isManualCompression = body.messages && body.messages.length > 0 &&
+            detectManualCompressionCommand(body.messages);
+
+        if (isManualCompression) {
+            console.log('[Kiro] Manual compression command detected');
+        }
+
+        if ((enableCompression || isManualCompression) && body.messages && body.messages.length > 0) {
             try {
-                const compressionResult = await compressContextWithSummary(
+                const compressionResult = await compressContextByWeight(
                     body.messages,
                     model,
                     body.system,
                     body.tools,
                     this.config,
-                    this // 传递服务实例用于调用 Haiku
+                    this, // 传递服务实例用于调用 Opus 4.5
+                    isManualCompression // 手动触发时强制压缩
                 );
 
                 if (compressionResult.compressed) {
@@ -2146,7 +2725,11 @@ export class KiroApiService {
                         ...body,
                         messages: compressionResult.messages
                     };
-                    console.log(`[Kiro] Context compressed: ${compressionResult.originalTokens} -> ${compressionResult.compressedTokens} tokens`);
+                    const triggerType = compressionResult.manualTriggered ? '(Manual)' : '(Auto)';
+                    console.log(`[Kiro] Context compressed ${triggerType}: ${compressionResult.originalTokens} -> ${compressionResult.compressedTokens} tokens`);
+                    if (compressionResult.stats) {
+                        console.log(`[Kiro] Compression stats: ${compressionResult.stats.highScoreKept} high-score, ${compressionResult.stats.lowScoreSummarized} summarized, ${compressionResult.stats.recentKept} recent`);
+                    }
                 }
             } catch (compressionError) {
                 console.error('[Kiro] Context compression failed, using original messages:', compressionError.message);
