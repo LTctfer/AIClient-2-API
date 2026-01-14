@@ -1554,6 +1554,15 @@ const MANUAL_COMPRESSION_KEYWORDS = [
     '/compress'
 ];
 
+// Claude Code /compact 命令发送的特征短语
+const COMPACT_COMMAND_PATTERNS = [
+    'your task is to create a detailed summary of the conversation',
+    'create a detailed summary of the conversation so far',
+    'summarize the conversation',
+    'compress the context',
+    'compact the conversation'
+];
+
 /**
  * 检测消息是否包含手动压缩指令
  * @param {Array} messages - 消息数组
@@ -1577,17 +1586,32 @@ function detectManualCompressionCommand(messages) {
     }
 
     const text = extractMessageText(lastMessage).trim().toLowerCase();
-    console.log(`[Kiro Compression] Last user message text: "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`);
+    console.log(`[Kiro Compression] Last user message text: "${text.substring(0, 80)}${text.length > 80 ? '...' : ''}"`);
 
     // 检查是否匹配手动压缩关键词
-    const matched = MANUAL_COMPRESSION_KEYWORDS.some(keyword =>
+    const keywordMatched = MANUAL_COMPRESSION_KEYWORDS.some(keyword =>
         text === keyword.toLowerCase() ||
         text.startsWith(keyword.toLowerCase() + ' ') ||
         text.startsWith(keyword.toLowerCase() + '\n')
     );
 
-    console.log(`[Kiro Compression] Manual compression command detected: ${matched}`);
-    return matched;
+    if (keywordMatched) {
+        console.log(`[Kiro Compression] Manual compression command detected via keyword`);
+        return true;
+    }
+
+    // 检查是否匹配 Claude Code /compact 命令的特征短语
+    const patternMatched = COMPACT_COMMAND_PATTERNS.some(pattern =>
+        text.includes(pattern.toLowerCase())
+    );
+
+    if (patternMatched) {
+        console.log(`[Kiro Compression] Manual compression command detected via Claude Code /compact pattern`);
+        return true;
+    }
+
+    console.log(`[Kiro Compression] Manual compression command detected: false`);
+    return false;
 }
 
 /**
@@ -1760,6 +1784,7 @@ ${lowScoreSummary}
         originalTokens,
         compressedTokens,
         manualTriggered: forceCompress,
+        summary: lowScoreSummary || null,
         stats: {
             highScoreKept: highScore.length,
             lowScoreSummarized: lowScore.length,
@@ -3419,6 +3444,20 @@ export class KiroApiService {
     async callApi(method, model, body, isRetry = false, retryCount = 0) {
         if (!this.isInitialized) await this.initialize();
 
+        // === 调试：打印最后一条消息内容 ===
+        if (body.messages && body.messages.length > 0) {
+            const lastMsg = body.messages[body.messages.length - 1];
+            console.log(`[Kiro Debug] Last message role: ${lastMsg.role}, content type: ${typeof lastMsg.content}`);
+            if (typeof lastMsg.content === 'string') {
+                console.log(`[Kiro Debug] Last message text: "${lastMsg.content.substring(0, 100)}"`);
+            } else if (Array.isArray(lastMsg.content)) {
+                console.log(`[Kiro Debug] Last message content blocks: ${lastMsg.content.length}`);
+                lastMsg.content.forEach((block, i) => {
+                    console.log(`[Kiro Debug]   Block ${i}: type=${block.type}, text="${block.text?.substring(0, 50) || '(no text)'}"`);
+                });
+            }
+        }
+
         // === 基于权重的上下文压缩：在构建请求前压缩上下文 ===
         let processedBody = body;
         const enableCompression = this.config.KIRO_ENABLE_CONTEXT_COMPRESSION ?? true;
@@ -3452,6 +3491,16 @@ export class KiroApiService {
                     console.log(`[Kiro] Context compressed ${triggerType}: ${compressionResult.originalTokens} -> ${compressionResult.compressedTokens} tokens`);
                     if (compressionResult.stats) {
                         console.log(`[Kiro] Compression stats: ${compressionResult.stats.highScoreKept} high-score, ${compressionResult.stats.lowScoreSummarized} summarized, ${compressionResult.stats.recentKept} recent`);
+                    }
+
+                    // 手动压缩时，保存压缩信息供响应时展示
+                    if (compressionResult.manualTriggered) {
+                        this._lastCompressionResult = {
+                            originalTokens: compressionResult.originalTokens,
+                            compressedTokens: compressionResult.compressedTokens,
+                            summary: compressionResult.summary,
+                            stats: compressionResult.stats
+                        };
                     }
                 }
             } catch (compressionError) {
@@ -3562,7 +3611,17 @@ export class KiroApiService {
                 inputTokens = this.calculateInputTokensFromPercentage(percentage);
             }
 
-            return this.buildClaudeResponse(responseText, false, 'assistant', model, toolCalls, inputTokens);
+            // 检查是否有手动压缩结果需要展示
+            let finalResponseText = responseText;
+            if (this._lastCompressionResult) {
+                const cr = this._lastCompressionResult;
+                const compressionInfo = `\n\n---\n**上下文压缩完成**\n- 原始 tokens: ${cr.originalTokens.toLocaleString()}\n- 压缩后 tokens: ${cr.compressedTokens.toLocaleString()}\n- 压缩率: ${cr.stats.reductionPercent}%\n- 保留高分消息: ${cr.stats.highScoreKept} 条\n- 压缩低分消息: ${cr.stats.lowScoreSummarized} 条\n- 保留最近消息: ${cr.stats.recentKept} 条\n\n<details>\n<summary>点击查看压缩摘要</summary>\n\n${cr.summary || '(无摘要内容)'}\n</details>\n---`;
+                finalResponseText = compressionInfo + (responseText ? '\n\n' + responseText : '');
+                // 清除压缩结果，避免重复展示
+                this._lastCompressionResult = null;
+            }
+
+            return this.buildClaudeResponse(finalResponseText, false, 'assistant', model, toolCalls, inputTokens);
         } catch (error) {
             console.error('[Kiro] Error in generateContent:', toSafeErrorLog(error));
             throw new Error(`Error processing response: ${error.message}`);
@@ -3824,6 +3883,71 @@ export class KiroApiService {
         const finalModel = MODEL_MAPPING[model] ? model : this.modelName;
         console.log(`[Kiro] Calling generateContentStream with model: ${finalModel} (real streaming)`);
 
+        // === 调试：打印最后一条消息内容 ===
+        if (requestBody.messages && requestBody.messages.length > 0) {
+            const lastMsg = requestBody.messages[requestBody.messages.length - 1];
+            console.log(`[Kiro Debug Stream] Last message role: ${lastMsg.role}, content type: ${typeof lastMsg.content}`);
+            if (typeof lastMsg.content === 'string') {
+                console.log(`[Kiro Debug Stream] Last message text: "${lastMsg.content.substring(0, 200)}"`);
+            } else if (Array.isArray(lastMsg.content)) {
+                console.log(`[Kiro Debug Stream] Last message content blocks: ${lastMsg.content.length}`);
+                lastMsg.content.forEach((block, i) => {
+                    console.log(`[Kiro Debug Stream]   Block ${i}: type=${block.type}, text="${block.text?.substring(0, 100) || '(no text)'}"`);
+                });
+            }
+        }
+
+        // === 基于权重的上下文压缩：在构建请求前压缩上下文 ===
+        let processedRequestBody = requestBody;
+        const enableCompression = this.config.KIRO_ENABLE_CONTEXT_COMPRESSION ?? true;
+
+        // 检测是否为手动压缩指令
+        const isManualCompression = requestBody.messages && requestBody.messages.length > 0 &&
+            detectManualCompressionCommand(requestBody.messages);
+
+        if (isManualCompression) {
+            console.log('[Kiro Stream] Manual compression command detected');
+        }
+
+        if ((enableCompression || isManualCompression) && requestBody.messages && requestBody.messages.length > 0) {
+            try {
+                const compressionResult = await compressContextByWeight(
+                    requestBody.messages,
+                    finalModel,
+                    requestBody.system,
+                    requestBody.tools,
+                    this.config,
+                    this, // 传递服务实例用于调用 Opus 4.5
+                    isManualCompression // 手动触发时强制压缩
+                );
+
+                if (compressionResult.compressed) {
+                    processedRequestBody = {
+                        ...requestBody,
+                        messages: compressionResult.messages
+                    };
+                    const triggerType = compressionResult.manualTriggered ? '(Manual)' : '(Auto)';
+                    console.log(`[Kiro Stream] Context compressed ${triggerType}: ${compressionResult.originalTokens} -> ${compressionResult.compressedTokens} tokens`);
+                    if (compressionResult.stats) {
+                        console.log(`[Kiro Stream] Compression stats: ${compressionResult.stats.highScoreKept} high-score, ${compressionResult.stats.lowScoreSummarized} summarized, ${compressionResult.stats.recentKept} recent`);
+                    }
+
+                    // 手动压缩时，保存压缩信息供响应时展示
+                    if (compressionResult.manualTriggered) {
+                        this._lastCompressionResult = {
+                            originalTokens: compressionResult.originalTokens,
+                            compressedTokens: compressionResult.compressedTokens,
+                            summary: compressionResult.summary,
+                            stats: compressionResult.stats
+                        };
+                    }
+                }
+            } catch (compressionError) {
+                console.error('[Kiro Stream] Context compression failed, using original messages:', compressionError.message);
+                // 压缩失败时继续使用原始消息
+            }
+        }
+
         let inputTokens = 0;
         let contextUsagePercentage = null;
         const messageId = `${uuidv4()}`;
@@ -3932,7 +4056,7 @@ export class KiroApiService {
             const toolCalls = [];
             let currentToolCall = null;
 
-            for await (const event of this.streamApiReal('', finalModel, requestBody)) {
+            for await (const event of this.streamApiReal('', finalModel, processedRequestBody)) {
                 if (event.type === 'contextUsage' && event.percentage) {
                     contextUsagePercentage = event.percentage;
                     inputTokens = this.calculateInputTokensFromPercentage(contextUsagePercentage);
@@ -4168,6 +4292,42 @@ export class KiroApiService {
             outputTokens = this.countTextTokens(plainForCount);
             for (const tc of toolCalls) {
                 outputTokens += this.countTextTokens(JSON.stringify(tc.input || {}));
+            }
+
+            // === 手动压缩时，在流结束前展示压缩摘要 ===
+            if (this._lastCompressionResult) {
+                const cr = this._lastCompressionResult;
+                const compressionRatio = ((1 - cr.compressedTokens / cr.originalTokens) * 100).toFixed(1);
+                let compressionInfo = `\n\n---\n**上下文压缩完成**\n`;
+                compressionInfo += `- 原始 tokens: ${cr.originalTokens.toLocaleString()}\n`;
+                compressionInfo += `- 压缩后 tokens: ${cr.compressedTokens.toLocaleString()}\n`;
+                compressionInfo += `- 压缩率: ${compressionRatio}%\n`;
+                if (cr.stats) {
+                    compressionInfo += `- 保留高分消息: ${cr.stats.highScoreKept} 条\n`;
+                    compressionInfo += `- 摘要化消息: ${cr.stats.lowScoreSummarized} 条\n`;
+                    compressionInfo += `- 保留最近消息: ${cr.stats.recentKept} 条\n`;
+                }
+                if (cr.summary) {
+                    compressionInfo += `\n**压缩摘要:**\n${cr.summary}\n`;
+                }
+                compressionInfo += `---\n`;
+
+                // 发送压缩摘要作为额外的文本块
+                const compressionBlockIndex = streamState.nextBlockIndex++;
+                yield {
+                    type: "content_block_start",
+                    index: compressionBlockIndex,
+                    content_block: { type: "text", text: "" }
+                };
+                yield {
+                    type: "content_block_delta",
+                    index: compressionBlockIndex,
+                    delta: { type: "text_delta", text: compressionInfo }
+                };
+                yield { type: "content_block_stop", index: compressionBlockIndex };
+
+                // 清除压缩结果
+                this._lastCompressionResult = null;
             }
 
             yield {
