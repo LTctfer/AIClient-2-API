@@ -1,18 +1,14 @@
 /**
  * 上下文压缩器 - 整合所有压缩组件的主入口
  *
+ * 与 claude-kiro.js 保持一致的压缩逻辑
+ *
  * 处理流水线：
  * 1. 文件修改追踪 - 建立文件修改历史
  * 2. 语义去重 - 合并重复的工具调用结果
  * 3. 消息分类 - 将消息分为4类
  * 4. 权重打分 - 为消息计算权重分数
- * 5. 压缩处理 - 根据分数进行压缩或丢弃
- *
- * 预期效果：
- * - 读取同一文件5次：压缩率 ~76%
- * - 相同搜索3次：压缩率 ~60%
- * - 重复错误信息：压缩率 ~75%
- * - 整体预期：在权重压缩基础上，额外提升 20-40% 压缩率
+ * 5. 压缩处理 - 高分消息保留，低分消息生成压缩上下文
  */
 
 import { MessageClassifier, MessageCategory } from './MessageClassifier.js';
@@ -20,7 +16,7 @@ import { WeightScorer, COMPRESSION_THRESHOLDS } from './WeightScorer.js';
 import { SemanticDeduplicator } from './SemanticDeduplicator.js';
 import { FileModificationTracker } from './FileModificationTracker.js';
 
-// 默认配置
+// 默认配置（与 claude-kiro WEIGHT_COMPRESSION_CONFIG 一致）
 const DEFAULT_CONFIG = {
   // 是否启用语义去重
   enableDeduplication: true,
@@ -28,26 +24,26 @@ const DEFAULT_CONFIG = {
   // 是否启用权重压缩
   enableWeightCompression: true,
 
-  // 是否启用时间衰减
-  enableTimeDecay: true,
+  // 越新的消息加分越多（与 claude-kiro MAX_RECENCY_BONUS 一致）
+  maxRecencyBonus: 20,
 
-  // 时间衰减半衰期（消息数）
-  timeDecayHalfLife: 20,
+  // 压缩阈值（与 claude-kiro 一致）
+  highScoreThreshold: 70,
 
-  // 压缩阈值
-  thresholds: COMPRESSION_THRESHOLDS,
+  // 保留最近 N 条消息不压缩
+  keepRecentCount: 10,
+
+  // 压缩块中每条消息最大字符数
+  compressedMsgMaxChars: 300,
+
+  // 压缩块总最大字符数
+  compressedTotalMaxChars: 8000,
 
   // 最大保留消息数（0 表示不限制）
   maxMessages: 0,
 
-  // 目标压缩率（0-1，0 表示不限制）
-  targetCompressionRatio: 0,
-
   // 是否保留压缩元数据
-  preserveMetadata: false,
-
-  // 摘要生成器（可选，用于激进压缩）
-  summaryGenerator: null
+  preserveMetadata: false
 };
 
 export class ContextCompressor {
@@ -57,16 +53,14 @@ export class ContextCompressor {
     // 初始化组件
     this.classifier = new MessageClassifier();
     this.scorer = new WeightScorer({
-      timeDecayEnabled: this.config.enableTimeDecay,
-      timeDecayHalfLife: this.config.timeDecayHalfLife,
-      thresholds: this.config.thresholds
+      maxRecencyBonus: this.config.maxRecencyBonus
     });
     this.deduplicator = new SemanticDeduplicator();
     this.fileTracker = new FileModificationTracker();
   }
 
   /**
-   * 压缩消息数组
+   * 压缩消息数组（与 claude-kiro 压缩逻辑一致）
    * @param {Array} messages - 原始消息数组
    * @param {Object} options - 压缩选项
    * @returns {Object} 压缩结果
@@ -120,7 +114,7 @@ export class ContextCompressor {
         stats: this.scorer.getStatistics(scoredMessages)
       });
 
-      // 阶段5：根据分数进行压缩
+      // 阶段5：根据分数进行压缩（与 claude-kiro 一致）
       processedMessages = this._applyWeightCompression(
         scoredMessages,
         mergedOptions
@@ -174,58 +168,38 @@ export class ContextCompressor {
   }
 
   /**
-   * 激进压缩 - 最大程度压缩，可能丢失部分信息
-   * @param {Array} messages - 原始消息数组
-   * @param {number} targetRatio - 目标压缩率 (0-1)
-   * @returns {Object} 压缩结果
-   */
-  aggressiveCompress(messages, targetRatio = 0.5) {
-    return this.compress(messages, {
-      enableDeduplication: true,
-      enableWeightCompression: true,
-      targetCompressionRatio: targetRatio,
-      thresholds: {
-        KEEP: 80,
-        LIGHT_COMPRESS: 60,
-        HEAVY_COMPRESS: 40,
-        DISCARD: 0
-      }
-    });
-  }
-
-  /**
-   * 应用权重压缩
+   * 应用权重压缩（与 claude-kiro 一致）
+   * 高分消息完整保留，低分消息生成压缩上下文
    */
   _applyWeightCompression(scoredMessages, options) {
-    const filtered = this.scorer.filterByScore(scoredMessages);
+    const { highScore, lowScore } = this.scorer.filterByScore(scoredMessages);
     const result = [];
 
     // 保留高分消息
-    for (const item of filtered.keep) {
+    for (const item of highScore) {
       result.push(item.message);
     }
 
-    // 轻度压缩消息
-    for (const item of filtered.lightCompress) {
-      const compressed = this._lightCompress(item);
-      result.push(compressed);
-    }
-
-    // 激进压缩消息
-    for (const item of filtered.heavyCompress) {
-      const compressed = this._heavyCompress(item);
-      if (compressed) {
-        result.push(compressed);
+    // 低分消息生成压缩上下文（与 claude-kiro formatCompressedContext 一致）
+    if (lowScore.length > 0) {
+      const compressedContext = this._formatCompressedContext(lowScore, options);
+      if (compressedContext) {
+        // 将压缩上下文作为一条 assistant 消息插入
+        result.push({
+          role: 'assistant',
+          content: compressedContext,
+          _compressed: true,
+          _compressedCount: lowScore.length
+        });
       }
     }
 
-    // 丢弃低分消息（不添加到结果中）
-    // filtered.discard 中的消息被丢弃
-
-    // 按原始顺序排序
+    // 按原始顺序排序（压缩消息放在最前面）
     result.sort((a, b) => {
-      const indexA = a._originalIndex ?? scoredMessages.findIndex(s => s.message === a);
-      const indexB = b._originalIndex ?? scoredMessages.findIndex(s => s.message === b);
+      if (a._compressed) return -1;
+      if (b._compressed) return 1;
+      const indexA = scoredMessages.findIndex(s => s.message === a);
+      const indexB = scoredMessages.findIndex(s => s.message === b);
       return indexA - indexB;
     });
 
@@ -233,118 +207,110 @@ export class ContextCompressor {
   }
 
   /**
-   * 轻度压缩消息
+   * 格式化压缩上下文（与 claude-kiro formatCompressedContext 一致）
+   * @param {Array} lowScoreMessages - 低分消息数组
+   * @param {Object} options - 配置选项
+   * @returns {string} 格式化后的压缩上下文
    */
-  _lightCompress(scoredItem) {
-    const { message, classification } = scoredItem;
-
-    // 用户指令不压缩
-    if (classification.category === MessageCategory.USER_INSTRUCTION) {
-      return message;
+  _formatCompressedContext(lowScoreMessages, options) {
+    if (lowScoreMessages.length === 0) {
+      return '';
     }
 
-    // 工具结果：截断过长内容
-    if (message.role === 'tool' || classification.reason?.includes('tool_result')) {
-      return this._truncateToolResult(message, 1000);
-    }
+    const maxCharsPerMessage = options.compressedMsgMaxChars || 300;
+    const maxTotalChars = options.compressedTotalMaxChars || 8000;
 
-    // 其他消息：截断过长文本
-    return this._truncateMessage(message, 500);
-  }
+    const parts = [];
+    let totalChars = 0;
 
-  /**
-   * 激进压缩消息
-   */
-  _heavyCompress(scoredItem) {
-    const { message, classification } = scoredItem;
-
-    // 用户指令不压缩
-    if (classification.category === MessageCategory.USER_INSTRUCTION) {
-      return message;
-    }
-
-    // 失败记录：只保留摘要
-    if (classification.category === MessageCategory.FAILURE_RECORD) {
-      return this._createSummaryMessage(message, '失败记录');
-    }
-
-    // 中间推理：只保留关键信息
-    if (classification.category === MessageCategory.INTERMEDIATE_REASONING) {
-      return this._createSummaryMessage(message, '中间推理');
-    }
-
-    // 工具结果：极度截断
-    if (message.role === 'tool') {
-      return this._truncateToolResult(message, 200);
-    }
-
-    return this._truncateMessage(message, 200);
-  }
-
-  /**
-   * 截断工具结果
-   */
-  _truncateToolResult(message, maxLength) {
-    const newMessage = { ...message };
-
-    if (typeof newMessage.content === 'string') {
-      if (newMessage.content.length > maxLength) {
-        newMessage.content = newMessage.content.substring(0, maxLength) +
-          `\n... [已截断，原长度: ${message.content.length} 字符]`;
-      }
-    } else if (Array.isArray(newMessage.content)) {
-      newMessage.content = newMessage.content.map(block => {
-        if (block.type === 'text' && block.text?.length > maxLength) {
-          return {
-            ...block,
-            text: block.text.substring(0, maxLength) +
-              `\n... [已截断，原长度: ${block.text.length} 字符]`
-          };
-        }
-        return block;
-      });
-    }
-
-    return newMessage;
-  }
-
-  /**
-   * 截断消息
-   */
-  _truncateMessage(message, maxLength) {
-    const newMessage = { ...message };
-
-    if (typeof newMessage.content === 'string') {
-      if (newMessage.content.length > maxLength) {
-        newMessage.content = newMessage.content.substring(0, maxLength) + '...';
-      }
-    } else if (Array.isArray(newMessage.content)) {
-      newMessage.content = newMessage.content.map(block => {
-        if (block.type === 'text' && block.text?.length > maxLength) {
-          return {
-            ...block,
-            text: block.text.substring(0, maxLength) + '...'
-          };
-        }
-        return block;
-      });
-    }
-
-    return newMessage;
-  }
-
-  /**
-   * 创建摘要消息
-   */
-  _createSummaryMessage(message, type) {
-    const contentLength = this._getContentLength(message);
-
-    return {
-      ...message,
-      content: `[${type}已压缩] 原内容长度: ${contentLength} 字符`,
-      _compressed: true,
-      _originalLength: contentLength
+    // 按类别分组
+    const byCategory = {
+      [MessageCategory.INTERMEDIATE_REASONING]: [],
+      [MessageCategory.FAILURE_RECORD]: []
     };
+
+    for (const scored of lowScoreMessages) {
+      const category = byCategory[scored.classification.category]
+        ? scored.classification.category
+        : MessageCategory.INTERMEDIATE_REASONING;
+      byCategory[category].push(scored);
+    }
+
+    // 格式化中间推理消息
+    if (byCategory[MessageCategory.INTERMEDIATE_REASONING].length > 0) {
+      parts.push(`<compressed_context type="intermediate_reasoning" count="${byCategory[MessageCategory.INTERMEDIATE_REASONING].length}">`);
+
+      for (const scored of byCategory[MessageCategory.INTERMEDIATE_REASONING]) {
+        if (totalChars >= maxTotalChars) {
+          parts.push(`... (${byCategory[MessageCategory.INTERMEDIATE_REASONING].length - parts.length + 1} more messages omitted)`);
+          break;
+        }
+
+        const message = scored.message;
+        let content = this._extractMessageContent(message, maxCharsPerMessage);
+
+        if (content.trim()) {
+          parts.push(`[${message.role}#${scored.classification.index}] ${content.trim()}`);
+          totalChars += content.length;
+        }
+      }
+
+      parts.push('</compressed_context>');
+    }
+
+    // 格式化失败记录
+    if (byCategory[MessageCategory.FAILURE_RECORD].length > 0) {
+      parts.push(`<compressed_context type="failure_records" count="${byCategory[MessageCategory.FAILURE_RECORD].length}">`);
+
+      for (const scored of byCategory[MessageCategory.FAILURE_RECORD]) {
+        if (totalChars >= maxTotalChars) {
+          parts.push(`... (${byCategory[MessageCategory.FAILURE_RECORD].length} failure records, details omitted)`);
+          break;
+        }
+
+        const message = scored.message;
+        const content = this._extractMessageContent(message, maxCharsPerMessage);
+
+        if (content.trim()) {
+          parts.push(`[${message.role}#${scored.classification.index}] ${content.trim()}`);
+          totalChars += content.length;
+        }
+      }
+
+      parts.push('</compressed_context>');
+    }
+
+    return parts.join('\n');
+  }
+
+  /**
+   * 提取消息内容（与 claude-kiro 一致）
+   */
+  _extractMessageContent(message, maxChars) {
+    let content = '';
+
+    if (Array.isArray(message.content)) {
+      for (const part of message.content) {
+        if (part.type === 'text' && part.text) {
+          content += part.text + '\n';
+        } else if (part.type === 'tool_use') {
+          content += `[Tool: ${part.name}${part.input?.file_path ? ` file="${part.input.file_path}"` : ''}${part.input?.pattern ? ` pattern="${part.input.pattern}"` : ''}${part.input?.command ? ` cmd="${part.input.command.slice(0, 50)}"` : ''}]\n`;
+        } else if (part.type === 'tool_result') {
+          const resultText = typeof part.content === 'string' ? part.content : JSON.stringify(part.content || '');
+          const lines = resultText.split('\n').slice(0, 5);
+          content += `[Result: ${lines.join(' ').slice(0, 150)}${resultText.length > 150 ? '...' : ''}]\n`;
+        }
+      }
+    } else if (typeof message.content === 'string') {
+      content = message.content;
+    }
+
+    // 截断过长的内容
+    if (content.length > maxChars) {
+      content = content.slice(0, maxChars) + '...';
+    }
+
+    return content;
   }
 
   /**
@@ -363,7 +329,6 @@ export class ContextCompressor {
     const availableSlots = maxMessages - userMessages.length;
 
     if (availableSlots <= 0) {
-      // 用户消息已经超过限制，只保留最新的用户消息
       return userMessages.slice(-maxMessages);
     }
 
@@ -401,39 +366,14 @@ export class ContextCompressor {
   }
 
   /**
-   * 获取消息内容长度
-   */
-  _getContentLength(message) {
-    const content = message.content;
-
-    if (typeof content === 'string') {
-      return content.length;
-    }
-
-    if (Array.isArray(content)) {
-      return content.reduce((sum, block) => {
-        if (block.type === 'text') {
-          return sum + (block.text?.length || 0);
-        }
-        return sum + JSON.stringify(block).length;
-      }, 0);
-    }
-
-    return JSON.stringify(content).length;
-  }
-
-  /**
    * 更新配置
    */
   updateConfig(newConfig) {
     this.config = { ...this.config, ...newConfig };
 
-    // 更新子组件配置
-    if (newConfig.timeDecayHalfLife !== undefined || newConfig.enableTimeDecay !== undefined) {
+    if (newConfig.maxRecencyBonus !== undefined) {
       this.scorer = new WeightScorer({
-        timeDecayEnabled: this.config.enableTimeDecay,
-        timeDecayHalfLife: this.config.timeDecayHalfLife,
-        thresholds: this.config.thresholds
+        maxRecencyBonus: this.config.maxRecencyBonus
       });
     }
   }
