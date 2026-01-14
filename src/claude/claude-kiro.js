@@ -166,6 +166,610 @@ const CLASSIFICATION_KEYWORDS = {
 // 兼容旧配置名（向后兼容）
 const SUMMARY_CONFIG = WEIGHT_COMPRESSION_CONFIG;
 
+// =============================================================================
+// 语义去重系统 - 合并重复的工具调用结果
+// =============================================================================
+
+/**
+ * 语义去重配置常量
+ */
+const DEDUP_CONFIG = {
+    // 启用开关
+    ENABLE_DEDUPLICATION: true,
+
+    // 相似度阈值
+    EXACT_MATCH_THRESHOLD: 1.0,       // 完全匹配
+    HIGH_SIMILARITY_THRESHOLD: 0.9,   // 高相似度（去重+引用）
+    LOW_SIMILARITY_THRESHOLD: 0.5,    // 低相似度（保留差异摘要）
+
+    // 幂等工具列表（可安全去重）
+    IDEMPOTENT_TOOLS: ['Read', 'Grep', 'Glob', 'WebFetch', 'WebSearch'],
+
+    // 修改类工具列表（触发文件失效）
+    MODIFYING_TOOLS: ['Edit', 'Write', 'NotebookEdit'],
+
+    // 只读 Bash 命令白名单
+    READONLY_BASH_COMMANDS: [
+        'ls', 'cat', 'head', 'tail', 'find', 'grep', 'pwd', 'which', 'echo',
+        'wc', 'du', 'df', 'file', 'stat', 'tree', 'less', 'more', 'diff',
+        'git status', 'git log', 'git diff', 'git branch', 'git show',
+        'npm list', 'npm ls', 'node -v', 'npm -v', 'python --version'
+    ],
+
+    // 写入 Bash 命令黑名单关键词
+    WRITE_BASH_KEYWORDS: [
+        '>', '>>', 'rm ', 'rm\t', 'mv ', 'cp ', 'mkdir ', 'touch ',
+        'sed -i', 'awk -i', 'chmod ', 'chown ', 'npm install', 'npm i ',
+        'pip install', 'apt ', 'yum ', 'brew '
+    ],
+
+    // 引用模板
+    REFERENCE_TEMPLATE: '[此结果与消息 #{index} 相同，已省略约 {tokens} tokens]',
+    DIFF_TEMPLATE: '[文件已变化] 相比消息 #{index}: {summary}'
+};
+
+/**
+ * 文件修改追踪器
+ * 追踪哪些文件在对话中被修改过，用于判断旧的 Read 结果是否过期
+ */
+class FileModificationTracker {
+    constructor() {
+        // 文件路径 → 最后修改的消息索引
+        this.modifications = new Map();
+    }
+
+    /**
+     * 记录文件修改
+     * @param {string} filePath - 文件路径
+     * @param {number} messageIndex - 消息索引
+     */
+    recordModification(filePath, messageIndex) {
+        if (!filePath) return;
+        // 标准化路径
+        const normalizedPath = this._normalizePath(filePath);
+        const existing = this.modifications.get(normalizedPath);
+        if (!existing || existing < messageIndex) {
+            this.modifications.set(normalizedPath, messageIndex);
+        }
+    }
+
+    /**
+     * 检查某个文件的读取结果是否已失效
+     * @param {string} filePath - 文件路径
+     * @param {number} readIndex - 读取操作的消息索引
+     * @returns {boolean} 是否已失效
+     */
+    isInvalidated(filePath, readIndex) {
+        if (!filePath) return false;
+        const normalizedPath = this._normalizePath(filePath);
+        const lastModified = this.modifications.get(normalizedPath);
+        // 如果文件在读取之后被修改过，则该读取结果已失效
+        return lastModified !== undefined && lastModified > readIndex;
+    }
+
+    /**
+     * 获取文件最后修改的消息索引
+     * @param {string} filePath - 文件路径
+     * @returns {number|undefined}
+     */
+    getLastModification(filePath) {
+        if (!filePath) return undefined;
+        return this.modifications.get(this._normalizePath(filePath));
+    }
+
+    /**
+     * 标准化文件路径
+     */
+    _normalizePath(filePath) {
+        // 统一使用正斜杠，去除首尾空格
+        return filePath.trim().replace(/\\/g, '/').toLowerCase();
+    }
+
+    /**
+     * 获取统计信息
+     */
+    getStats() {
+        return {
+            trackedFiles: this.modifications.size,
+            files: Array.from(this.modifications.entries())
+        };
+    }
+}
+
+/**
+ * 去重索引表
+ * 维护工具调用指纹到消息记录的映射
+ */
+class DeduplicationIndex {
+    constructor() {
+        // 指纹 → 调用记录列表
+        this.index = new Map();
+    }
+
+    /**
+     * 添加工具调用记录
+     * @param {string} fingerprint - 工具调用指纹
+     * @param {Object} record - 调用记录
+     */
+    add(fingerprint, record) {
+        if (!this.index.has(fingerprint)) {
+            this.index.set(fingerprint, []);
+        }
+        this.index.get(fingerprint).push(record);
+    }
+
+    /**
+     * 查找相同指纹的记录
+     * @param {string} fingerprint - 工具调用指纹
+     * @returns {Array} 记录列表
+     */
+    find(fingerprint) {
+        return this.index.get(fingerprint) || [];
+    }
+
+    /**
+     * 获取统计信息
+     */
+    getStats() {
+        let totalRecords = 0;
+        let duplicateFingerprints = 0;
+        for (const records of this.index.values()) {
+            totalRecords += records.length;
+            if (records.length > 1) {
+                duplicateFingerprints++;
+            }
+        }
+        return {
+            uniqueFingerprints: this.index.size,
+            totalRecords,
+            duplicateFingerprints
+        };
+    }
+}
+
+/**
+ * 从消息中提取工具调用详情
+ * @param {Object} message - 消息对象
+ * @param {number} messageIndex - 消息索引
+ * @returns {Array<Object>} 工具调用列表
+ */
+function extractToolCallDetails(message, messageIndex) {
+    const toolCalls = [];
+
+    if (!Array.isArray(message.content)) {
+        return toolCalls;
+    }
+
+    // 先收集所有 tool_use
+    const toolUseMap = new Map();
+    for (const part of message.content) {
+        if (part.type === 'tool_use' && part.id) {
+            toolUseMap.set(part.id, {
+                toolName: part.name,
+                params: part.input || {},
+                toolUseId: part.id
+            });
+        }
+    }
+
+    // 再收集 tool_result 并关联
+    for (const part of message.content) {
+        if (part.type === 'tool_result' && part.tool_use_id) {
+            const toolUse = toolUseMap.get(part.tool_use_id);
+            const resultContent = typeof part.content === 'string'
+                ? part.content
+                : JSON.stringify(part.content || '');
+
+            toolCalls.push({
+                toolName: toolUse?.toolName || '__unknown__',
+                params: toolUse?.params || {},
+                toolUseId: part.tool_use_id,
+                resultContent,
+                resultContentHash: crypto.createHash('md5').update(resultContent).digest('hex'),
+                messageIndex,
+                isError: part.is_error || false
+            });
+        }
+    }
+
+    // 处理只有 tool_use 没有 tool_result 的情况（assistant 消息）
+    if (message.role === 'assistant') {
+        for (const part of message.content) {
+            if (part.type === 'tool_use' && part.id) {
+                toolCalls.push({
+                    toolName: part.name,
+                    params: part.input || {},
+                    toolUseId: part.id,
+                    resultContent: null,
+                    resultContentHash: null,
+                    messageIndex,
+                    isToolUseOnly: true
+                });
+            }
+        }
+    }
+
+    return toolCalls;
+}
+
+/**
+ * 生成工具调用的指纹
+ * @param {Object} toolCall - 工具调用对象
+ * @returns {string|null} 指纹字符串，如果不支持去重则返回 null
+ */
+function generateToolFingerprint(toolCall) {
+    const { toolName, params } = toolCall;
+
+    // 检查是否为幂等工具
+    if (!DEDUP_CONFIG.IDEMPOTENT_TOOLS.includes(toolName) && toolName !== 'Bash') {
+        return null;
+    }
+
+    switch (toolName) {
+        case 'Read':
+            // Read: 基于文件路径
+            return `read:${params.file_path || params.path || ''}`;
+
+        case 'Grep':
+            // Grep: 基于 pattern + path + 主要选项
+            return `grep:${params.pattern || ''}:${params.path || ''}:${params.glob || ''}`;
+
+        case 'Glob':
+            // Glob: 基于 pattern + path
+            return `glob:${params.pattern || ''}:${params.path || ''}`;
+
+        case 'WebFetch':
+            // WebFetch: 基于 URL
+            return `webfetch:${params.url || ''}`;
+
+        case 'WebSearch':
+            // WebSearch: 基于查询
+            return `websearch:${params.query || ''}`;
+
+        case 'Bash':
+            // Bash: 只对只读命令生成指纹
+            const command = params.command || '';
+            if (isReadOnlyBashCommand(command)) {
+                return `bash:${crypto.createHash('md5').update(command).digest('hex')}`;
+            }
+            return null;
+
+        default:
+            return null;
+    }
+}
+
+/**
+ * 判断 Bash 命令是否为只读命令
+ * @param {string} command - Bash 命令
+ * @returns {boolean}
+ */
+function isReadOnlyBashCommand(command) {
+    if (!command) return false;
+
+    const trimmedCommand = command.trim().toLowerCase();
+
+    // 检查是否包含写入关键词
+    for (const keyword of DEDUP_CONFIG.WRITE_BASH_KEYWORDS) {
+        if (trimmedCommand.includes(keyword.toLowerCase())) {
+            return false;
+        }
+    }
+
+    // 检查是否以只读命令开头
+    for (const readonlyCmd of DEDUP_CONFIG.READONLY_BASH_COMMANDS) {
+        if (trimmedCommand.startsWith(readonlyCmd.toLowerCase())) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * 从工具调用中提取受影响的文件路径
+ * @param {Object} toolCall - 工具调用对象
+ * @returns {Array<string>} 受影响的文件路径列表
+ */
+function extractAffectedFiles(toolCall) {
+    const { toolName, params, resultContent } = toolCall;
+    const files = [];
+
+    switch (toolName) {
+        case 'Edit':
+        case 'Write':
+        case 'Read':
+            if (params.file_path) files.push(params.file_path);
+            if (params.path) files.push(params.path);
+            break;
+
+        case 'NotebookEdit':
+            if (params.notebook_path) files.push(params.notebook_path);
+            break;
+
+        case 'Bash':
+            // 尝试从命令中提取文件路径
+            const command = params.command || '';
+            const filePatterns = extractFilesFromBashCommand(command);
+            files.push(...filePatterns);
+            break;
+    }
+
+    return files.filter(f => f && typeof f === 'string');
+}
+
+/**
+ * 从 Bash 命令中提取可能被修改的文件路径
+ * @param {string} command - Bash 命令
+ * @returns {Array<string>}
+ */
+function extractFilesFromBashCommand(command) {
+    const files = [];
+    if (!command) return files;
+
+    // 匹配重定向目标文件
+    const redirectMatch = command.match(/>\s*["']?([^"'\s>]+)["']?/g);
+    if (redirectMatch) {
+        for (const match of redirectMatch) {
+            const file = match.replace(/^>\s*["']?/, '').replace(/["']?$/, '');
+            if (file && !file.startsWith('/dev/')) {
+                files.push(file);
+            }
+        }
+    }
+
+    // 匹配 sed -i 的目标文件
+    const sedMatch = command.match(/sed\s+-i[^\s]*\s+['"][^'"]*['"]\s+["']?([^"'\s]+)["']?/);
+    if (sedMatch && sedMatch[1]) {
+        files.push(sedMatch[1]);
+    }
+
+    return files;
+}
+
+/**
+ * 计算两个字符串的相似度（基于行的比较）
+ * @param {string} str1 - 字符串1
+ * @param {string} str2 - 字符串2
+ * @returns {{similarity: number, diffSummary: string}}
+ */
+function calculateSimilarity(str1, str2) {
+    if (!str1 && !str2) return { similarity: 1.0, diffSummary: '' };
+    if (!str1 || !str2) return { similarity: 0, diffSummary: '内容完全不同' };
+
+    // 完全相同
+    if (str1 === str2) {
+        return { similarity: 1.0, diffSummary: '' };
+    }
+
+    // 基于行的比较
+    const lines1 = str1.split('\n');
+    const lines2 = str2.split('\n');
+
+    // 使用简单的 LCS 近似计算
+    const set1 = new Set(lines1);
+    const set2 = new Set(lines2);
+
+    let commonLines = 0;
+    for (const line of set1) {
+        if (set2.has(line)) {
+            commonLines++;
+        }
+    }
+
+    const totalUniqueLines = new Set([...lines1, ...lines2]).size;
+    const similarity = totalUniqueLines > 0 ? commonLines / totalUniqueLines : 0;
+
+    // 生成差异摘要
+    const addedLines = lines2.filter(l => !set1.has(l)).length;
+    const removedLines = lines1.filter(l => !set2.has(l)).length;
+    const diffSummary = `+${addedLines}行 -${removedLines}行`;
+
+    return {
+        similarity: Math.round(similarity * 100) / 100,
+        diffSummary
+    };
+}
+
+/**
+ * 估算文本的 token 数量（简单估算）
+ * @param {string} text - 文本
+ * @returns {number}
+ */
+function estimateTokens(text) {
+    if (!text) return 0;
+    // 简单估算：英文约 4 字符/token，中文约 2 字符/token
+    const chineseChars = (text.match(/[\u4e00-\u9fa5]/g) || []).length;
+    const otherChars = text.length - chineseChars;
+    return Math.ceil(chineseChars / 2 + otherChars / 4);
+}
+
+/**
+ * 语义去重主函数
+ * 扫描消息数组，合并重复的工具调用结果
+ *
+ * @param {Array} messages - 原始消息数组
+ * @param {Object} config - 配置选项
+ * @returns {{messages: Array, stats: Object}}
+ */
+function deduplicateToolResults(messages, config = {}) {
+    const enableDedup = config.KIRO_ENABLE_DEDUPLICATION ?? DEDUP_CONFIG.ENABLE_DEDUPLICATION;
+
+    if (!enableDedup || !messages || messages.length === 0) {
+        return {
+            messages,
+            stats: { enabled: false, processed: 0, deduplicated: 0, tokensSaved: 0 }
+        };
+    }
+
+    console.log(`[Kiro Dedup] Starting semantic deduplication for ${messages.length} messages...`);
+
+    // 初始化追踪器和索引
+    const tracker = new FileModificationTracker();
+    const index = new DeduplicationIndex();
+
+    // 第一遍：扫描所有消息，建立索引和追踪修改
+    for (let i = 0; i < messages.length; i++) {
+        const message = messages[i];
+        const toolCalls = extractToolCallDetails(message, i);
+
+        for (const call of toolCalls) {
+            // 检查是否为修改类工具
+            if (DEDUP_CONFIG.MODIFYING_TOOLS.includes(call.toolName)) {
+                const affectedFiles = extractAffectedFiles(call);
+                for (const file of affectedFiles) {
+                    tracker.recordModification(file, i);
+                }
+            } else if (call.toolName === 'Bash') {
+                // Bash 命令需要检查是否为写入操作
+                const command = call.params.command || '';
+                if (!isReadOnlyBashCommand(command)) {
+                    const affectedFiles = extractAffectedFiles(call);
+                    for (const file of affectedFiles) {
+                        tracker.recordModification(file, i);
+                    }
+                }
+            }
+
+            // 为幂等工具生成指纹并加入索引
+            const fingerprint = generateToolFingerprint(call);
+            if (fingerprint && call.resultContent) {
+                index.add(fingerprint, {
+                    messageIndex: i,
+                    content: call.resultContent,
+                    contentHash: call.resultContentHash,
+                    toolUseId: call.toolUseId,
+                    params: call.params
+                });
+            }
+        }
+    }
+
+    console.log(`[Kiro Dedup] File tracker stats:`, tracker.getStats());
+    console.log(`[Kiro Dedup] Index stats:`, index.getStats());
+
+    // 第二遍：执行去重
+    const resultMessages = [];
+    let deduplicatedCount = 0;
+    let tokensSaved = 0;
+
+    for (let i = 0; i < messages.length; i++) {
+        const message = messages[i];
+        const toolCalls = extractToolCallDetails(message, i);
+
+        // 如果没有工具调用，直接保留
+        if (toolCalls.length === 0 || !Array.isArray(message.content)) {
+            resultMessages.push(message);
+            continue;
+        }
+
+        // 深拷贝消息
+        const newMessage = JSON.parse(JSON.stringify(message));
+        let messageModified = false;
+
+        // 处理每个 tool_result
+        for (let j = 0; j < newMessage.content.length; j++) {
+            const part = newMessage.content[j];
+            if (part.type !== 'tool_result' || !part.tool_use_id) {
+                continue;
+            }
+
+            // 找到对应的工具调用信息
+            const call = toolCalls.find(c => c.toolUseId === part.tool_use_id);
+            if (!call || !call.resultContent) {
+                continue;
+            }
+
+            // 生成指纹
+            const fingerprint = generateToolFingerprint(call);
+            if (!fingerprint) {
+                continue; // 不支持去重的工具
+            }
+
+            // 查找之前的相同调用
+            const previousCalls = index.find(fingerprint);
+            const earlierCalls = previousCalls.filter(c => c.messageIndex < i);
+
+            if (earlierCalls.length === 0) {
+                continue; // 没有之前的调用
+            }
+
+            // 获取文件路径（用于检查失效）
+            const filePath = call.params.file_path || call.params.path || null;
+
+            // 过滤掉已失效的记录
+            const validCalls = earlierCalls.filter(c => {
+                if (!filePath) return true;
+                return !tracker.isInvalidated(filePath, c.messageIndex);
+            });
+
+            if (validCalls.length === 0) {
+                continue; // 所有之前的调用都已失效
+            }
+
+            // 找到最近的有效调用
+            const nearest = validCalls[validCalls.length - 1];
+
+            // 计算相似度
+            const { similarity, diffSummary } = calculateSimilarity(call.resultContent, nearest.content);
+
+            // 根据相似度决定处理方式
+            if (similarity >= DEDUP_CONFIG.HIGH_SIMILARITY_THRESHOLD) {
+                // 高相似度：替换为引用
+                const savedTokens = estimateTokens(call.resultContent);
+                const reference = DEDUP_CONFIG.REFERENCE_TEMPLATE
+                    .replace('{index}', nearest.messageIndex + 1)
+                    .replace('{tokens}', savedTokens);
+
+                newMessage.content[j] = {
+                    type: 'tool_result',
+                    tool_use_id: part.tool_use_id,
+                    content: reference
+                };
+
+                messageModified = true;
+                deduplicatedCount++;
+                tokensSaved += savedTokens;
+
+                console.log(`[Kiro Dedup] Deduplicated: ${call.toolName} at msg#${i + 1} -> ref msg#${nearest.messageIndex + 1} (similarity: ${similarity}, saved: ${savedTokens} tokens)`);
+
+            } else if (similarity >= DEDUP_CONFIG.LOW_SIMILARITY_THRESHOLD) {
+                // 中等相似度：保留差异摘要
+                const diffNote = DEDUP_CONFIG.DIFF_TEMPLATE
+                    .replace('{index}', nearest.messageIndex + 1)
+                    .replace('{summary}', diffSummary);
+
+                // 在内容前添加差异说明
+                const originalContent = typeof part.content === 'string' ? part.content : JSON.stringify(part.content);
+                newMessage.content[j] = {
+                    type: 'tool_result',
+                    tool_use_id: part.tool_use_id,
+                    content: `${diffNote}\n\n${originalContent}`
+                };
+
+                messageModified = true;
+                console.log(`[Kiro Dedup] Added diff note: ${call.toolName} at msg#${i + 1} (similarity: ${similarity})`);
+            }
+            // 低相似度：不处理
+        }
+
+        resultMessages.push(messageModified ? newMessage : message);
+    }
+
+    const stats = {
+        enabled: true,
+        processed: messages.length,
+        deduplicated: deduplicatedCount,
+        tokensSaved,
+        trackerStats: tracker.getStats(),
+        indexStats: index.getStats()
+    };
+
+    console.log(`[Kiro Dedup] Deduplication complete: ${deduplicatedCount} tool results deduplicated, ~${tokensSaved} tokens saved`);
+
+    return { messages: resultMessages, stats };
+}
+
 /**
  * 摘要缓存类 - 基于消息哈希的 LRU 缓存
  * 支持增量缓存：当新消息是旧消息的超集时，可复用部分缓存
@@ -946,14 +1550,22 @@ async function compressContextByWeight(messages, model, systemPrompt = null, too
     // 深拷贝消息
     const allMessages = JSON.parse(JSON.stringify(messages));
 
+    // ===== 第一步：语义去重（在权重压缩之前执行）=====
+    const dedupResult = deduplicateToolResults(allMessages, config);
+    const deduplicatedMessages = dedupResult.messages;
+
+    if (dedupResult.stats.deduplicated > 0) {
+        console.log(`[Kiro Weight Compression] Semantic deduplication: ${dedupResult.stats.deduplicated} tool results deduplicated, ~${dedupResult.stats.tokensSaved} tokens saved`);
+    }
+
     // 如果是手动触发，移除压缩指令消息
-    let messagesToProcess = allMessages;
-    if (forceCompress && allMessages.length > 0) {
-        const lastMsg = allMessages[allMessages.length - 1];
+    let messagesToProcess = deduplicatedMessages;
+    if (forceCompress && deduplicatedMessages.length > 0) {
+        const lastMsg = deduplicatedMessages[deduplicatedMessages.length - 1];
         if (lastMsg.role === 'user') {
             const text = extractMessageText(lastMsg).trim().toLowerCase();
             if (MANUAL_COMPRESSION_KEYWORDS.some(kw => text === kw.toLowerCase() || text.startsWith(kw.toLowerCase()))) {
-                messagesToProcess = allMessages.slice(0, -1); // 移除压缩指令
+                messagesToProcess = deduplicatedMessages.slice(0, -1); // 移除压缩指令
                 console.log('[Kiro Weight Compression] Removed manual compression command from messages');
             }
         }
@@ -1053,7 +1665,8 @@ async function compressContextByWeight(messages, model, systemPrompt = null, too
             lowScoreSummarized: lowScore.length,
             recentKept: recentMessages.length,
             categoryStats,
-            reductionPercent
+            reductionPercent,
+            deduplication: dedupResult.stats
         }
     };
 }
