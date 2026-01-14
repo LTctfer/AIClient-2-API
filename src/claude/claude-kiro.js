@@ -103,8 +103,11 @@ function getSystemRuntimeInfo() {
  * 权重压缩配置常量
  */
 const WEIGHT_COMPRESSION_CONFIG = {
+    // 摘要 API 地址（使用本地代理）
+    SUMMARY_API_URL: 'http://localhost:3060/claude-kiro-oauth/v1/messages',
+
     // 摘要模型
-    SUMMARY_MODEL: 'claude-opus-4-5',
+    SUMMARY_MODEL: 'claude-opus-4-5-20251101',
     SUMMARY_MODEL_ID: 'claude-opus-4.5',
 
     // 消息分类权重
@@ -1192,61 +1195,121 @@ function formatLowScoreMessagesForSummary(lowScoreMessages) {
 }
 
 /**
- * 生成低分消息的统一摘要
+ * 将低分消息格式化为精简的上下文块（供当前模型自行理解）
+ * 不使用规则提取，而是保留关键结构让模型自己分析
  * @param {Array} lowScoreMessages - 低分消息数组
- * @param {Object} service - Kiro API 服务实例
  * @param {Object} config - 配置对象
- * @returns {Promise<string>}
+ * @returns {string} 格式化后的压缩上下文
  */
-async function generateLowScoreSummary(lowScoreMessages, service, config = {}) {
+function formatCompressedContext(lowScoreMessages, config = {}) {
     if (lowScoreMessages.length === 0) {
         return '';
     }
 
-    const formattedContent = formatLowScoreMessagesForSummary(lowScoreMessages);
+    const maxCharsPerMessage = config.KIRO_COMPRESSED_MSG_MAX_CHARS ?? 300;
+    const maxTotalChars = config.KIRO_COMPRESSED_TOTAL_MAX_CHARS ?? 8000;
 
-    // 统计各类别数量
-    const stats = {
-        intermediate: lowScoreMessages.filter(m => m.category === MessageCategory.INTERMEDIATE_REASONING).length,
-        failure: lowScoreMessages.filter(m => m.category === MessageCategory.FAILURE_RECORD).length
+    const parts = [];
+    let totalChars = 0;
+
+    // 按类别分组
+    const byCategory = {
+        [MessageCategory.INTERMEDIATE_REASONING]: [],
+        [MessageCategory.FAILURE_RECORD]: []
     };
 
-    const prompt = `你是一个对话摘要助手。请为以下对话片段生成简短摘要（不超过500字）。
-
-这些是对话中的次要内容，包括：
-- 中间推理过程：${stats.intermediate} 条（查询、分析、思考过程）
-- 失败记录：${stats.failure} 条（错误、异常、失败的尝试）
-
-请提取关键信息点，忽略重复和冗余内容。重点关注：
-1. 尝试过但失败的方案（避免重复）
-2. 重要的中间发现
-3. 关键的文件/代码位置信息
-
-内容如下：
-${formattedContent}
-
-请用简洁的要点形式输出摘要：`;
-
-    try {
-        const maxTokens = config.LOW_SCORE_SUMMARY_MAX_TOKENS || WEIGHT_COMPRESSION_CONFIG.LOW_SCORE_SUMMARY_MAX_TOKENS;
-
-        const summaryRequest = {
-            model: WEIGHT_COMPRESSION_CONFIG.SUMMARY_MODEL_ID,
-            max_tokens: maxTokens,
-            messages: [{ role: 'user', content: prompt }]
-        };
-
-        console.log(`[Kiro Weight Compression] Generating summary for ${lowScoreMessages.length} low-score messages...`);
-        const response = await service.callApi('POST', WEIGHT_COMPRESSION_CONFIG.SUMMARY_MODEL, summaryRequest, false, 0);
-        const result = service.parseApiResponse(response);
-
-        console.log(`[Kiro Weight Compression] Low-score summary generated successfully`);
-        return result.responseText || '[摘要生成失败]';
-    } catch (error) {
-        console.error(`[Kiro Weight Compression] Failed to generate summary:`, error.message);
-        // 降级：返回简单的统计信息
-        return `[自动摘要失败]\n- 中间推理: ${stats.intermediate} 条\n- 失败记录: ${stats.failure} 条\n请参考最近的对话上下文继续。`;
+    for (const scored of lowScoreMessages) {
+        const category = byCategory[scored.category] ? scored.category : MessageCategory.INTERMEDIATE_REASONING;
+        byCategory[category].push(scored);
     }
+
+    // 格式化中间推理消息
+    if (byCategory[MessageCategory.INTERMEDIATE_REASONING].length > 0) {
+        parts.push(`<compressed_context type="intermediate_reasoning" count="${byCategory[MessageCategory.INTERMEDIATE_REASONING].length}">`);
+
+        for (const scored of byCategory[MessageCategory.INTERMEDIATE_REASONING]) {
+            if (totalChars >= maxTotalChars) {
+                parts.push(`... (${byCategory[MessageCategory.INTERMEDIATE_REASONING].length - parts.length + 1} more messages omitted)`);
+                break;
+            }
+
+            const message = scored.message;
+            let content = '';
+
+            // 提取消息内容
+            if (Array.isArray(message.content)) {
+                for (const part of message.content) {
+                    if (part.type === 'text' && part.text) {
+                        content += part.text + '\n';
+                    } else if (part.type === 'tool_use') {
+                        content += `[Tool: ${part.name}${part.input?.file_path ? ` file="${part.input.file_path}"` : ''}${part.input?.pattern ? ` pattern="${part.input.pattern}"` : ''}${part.input?.command ? ` cmd="${part.input.command.slice(0, 50)}"` : ''}]\n`;
+                    } else if (part.type === 'tool_result') {
+                        const resultText = typeof part.content === 'string' ? part.content : JSON.stringify(part.content || '');
+                        // 工具结果只保留前几行
+                        const lines = resultText.split('\n').slice(0, 5);
+                        content += `[Result: ${lines.join(' ').slice(0, 150)}${resultText.length > 150 ? '...' : ''}]\n`;
+                    }
+                }
+            } else if (typeof message.content === 'string') {
+                content = message.content;
+            }
+
+            // 截断过长的内容
+            if (content.length > maxCharsPerMessage) {
+                content = content.slice(0, maxCharsPerMessage) + '...';
+            }
+
+            if (content.trim()) {
+                parts.push(`[${message.role}#${scored.index}] ${content.trim()}`);
+                totalChars += content.length;
+            }
+        }
+
+        parts.push('</compressed_context>');
+    }
+
+    // 格式化失败记录
+    if (byCategory[MessageCategory.FAILURE_RECORD].length > 0) {
+        parts.push(`<compressed_context type="failure_records" count="${byCategory[MessageCategory.FAILURE_RECORD].length}">`);
+
+        for (const scored of byCategory[MessageCategory.FAILURE_RECORD]) {
+            if (totalChars >= maxTotalChars) {
+                parts.push(`... (${byCategory[MessageCategory.FAILURE_RECORD].length} failure records, details omitted)`);
+                break;
+            }
+
+            const message = scored.message;
+            const text = extractMessageText(message);
+            const truncated = text.length > maxCharsPerMessage ? text.slice(0, maxCharsPerMessage) + '...' : text;
+
+            if (truncated.trim()) {
+                parts.push(`[${message.role}#${scored.index}] ${truncated.trim()}`);
+                totalChars += truncated.length;
+            }
+        }
+
+        parts.push('</compressed_context>');
+    }
+
+    return parts.join('\n');
+}
+
+/**
+ * 生成低分消息的统一摘要
+ * 使用格式化的压缩上下文，让当前模型自行理解
+ * @param {Array} lowScoreMessages - 低分消息数组
+ * @param {Object|null} service - Kiro API 服务实例（可选，用于 API 摘要）
+ * @param {Object} config - 配置对象
+ * @returns {Promise<string>}
+ */
+async function generateLowScoreSummary(lowScoreMessages, service = null, config = {}) {
+    if (lowScoreMessages.length === 0) {
+        return '';
+    }
+
+    // 使用格式化的压缩上下文（让当前模型自行理解）
+    console.log(`[Kiro Weight Compression] Formatting ${lowScoreMessages.length} low-score messages for model comprehension...`);
+    return formatCompressedContext(lowScoreMessages, config);
 }
 
 // =============================================================================
@@ -1403,8 +1466,8 @@ Summary:`;
 }
 
 /**
- * 调用 Opus 4.5 模型生成摘要（内部方法，由 KiroApiService 实例调用）
- * @param {KiroApiService} service - Kiro API 服务实例
+ * 调用本地代理 API 生成摘要
+ * @param {KiroApiService} service - Kiro API 服务实例（保留参数兼容性，但不再使用）
  * @param {string} conversationText - 对话文本
  * @param {string} tier - 摘要层级 ('tier2' 或 'tier3')
  * @param {string} codeBlocks - 代码块摘要
@@ -1433,24 +1496,48 @@ async function generateSummaryWithOpus(service, conversationText, tier, codeBloc
     const maxTokens = tier === 'tier2' ? SUMMARY_CONFIG.TIER2_MAX_SUMMARY_TOKENS : SUMMARY_CONFIG.TIER3_MAX_SUMMARY_TOKENS;
 
     try {
-        console.log(`[Kiro Summary] Generating ${tier} summary with Opus 4.5...`);
+        console.log(`[Kiro Summary] Generating ${tier} summary via local proxy API...`);
 
-        // 构建简化的请求（不带工具）
+        // 构建标准 Claude Messages API 请求
         const summaryRequest = {
+            model: SUMMARY_CONFIG.SUMMARY_MODEL,
+            max_tokens: maxTokens || 4096,
             messages: [
-                { role: 'user', content: [{ type: 'text', text: prompt }] }
-            ],
-            system: null,
-            tools: null,
-            thinking: null
+                { role: 'user', content: prompt }
+            ]
         };
 
-        // 使用 Opus 4.5 模型调用
-        const response = await service.callApi('POST', SUMMARY_CONFIG.SUMMARY_MODEL, summaryRequest, false, 0);
-        const result = service._processApiResponse(response);
+        // 调用本地代理 API
+        const response = await axios.post(
+            SUMMARY_CONFIG.SUMMARY_API_URL,
+            summaryRequest,
+            {
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                timeout: KIRO_CONSTANTS.AXIOS_TIMEOUT
+            }
+        );
+
+        // 解析标准 Claude Messages API 响应
+        const data = response.data;
+        let summaryText = '';
+
+        if (data.content && Array.isArray(data.content)) {
+            for (const block of data.content) {
+                if (block.type === 'text' && block.text) {
+                    summaryText += block.text;
+                }
+            }
+        } else if (typeof data.content === 'string') {
+            summaryText = data.content;
+        } else if (data.choices && data.choices[0]?.message?.content) {
+            // 兼容 OpenAI 格式响应
+            summaryText = data.choices[0].message.content;
+        }
 
         console.log(`[Kiro Summary] ${tier} summary generated successfully`);
-        return result.responseText || '[Summary generation failed]';
+        return summaryText || '[Summary generation failed]';
     } catch (error) {
         console.error(`[Kiro Summary] Failed to generate ${tier} summary:`, error.message);
         // 降级：返回简单的截断摘要
@@ -1473,20 +1560,34 @@ const MANUAL_COMPRESSION_KEYWORDS = [
  * @returns {boolean}
  */
 function detectManualCompressionCommand(messages) {
-    if (!messages || messages.length === 0) return false;
+    console.log(`[Kiro Compression] Checking for manual compression command, messages count: ${messages?.length || 0}`);
+
+    if (!messages || messages.length === 0) {
+        console.log('[Kiro Compression] No messages to check');
+        return false;
+    }
 
     // 检查最后一条用户消息
     const lastMessage = messages[messages.length - 1];
-    if (lastMessage.role !== 'user') return false;
+    console.log(`[Kiro Compression] Last message role: ${lastMessage.role}`);
+
+    if (lastMessage.role !== 'user') {
+        console.log('[Kiro Compression] Last message is not from user, skipping');
+        return false;
+    }
 
     const text = extractMessageText(lastMessage).trim().toLowerCase();
+    console.log(`[Kiro Compression] Last user message text: "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`);
 
     // 检查是否匹配手动压缩关键词
-    return MANUAL_COMPRESSION_KEYWORDS.some(keyword =>
+    const matched = MANUAL_COMPRESSION_KEYWORDS.some(keyword =>
         text === keyword.toLowerCase() ||
         text.startsWith(keyword.toLowerCase() + ' ') ||
         text.startsWith(keyword.toLowerCase() + '\n')
     );
+
+    console.log(`[Kiro Compression] Manual compression command detected: ${matched}`);
+    return matched;
 }
 
 /**
@@ -1539,13 +1640,7 @@ async function compressContextByWeight(messages, model, systemPrompt = null, too
         return { messages, compressed: false, originalTokens, compressedTokens: originalTokens, manualTriggered: false };
     }
 
-    // 如果没有服务实例，无法生成摘要，回退到简单截断
-    if (!service) {
-        console.log('[Kiro Weight Compression] No service instance available, falling back to truncation');
-        return { messages, compressed: false, originalTokens, compressedTokens: originalTokens, manualTriggered: forceCompress };
-    }
-
-    console.log(`[Kiro Weight Compression] Starting weight-based context compression...${forceCompress ? ' (Manual trigger)' : ''}`);
+    console.log(`[Kiro Weight Compression] Starting weight-based context compression...${forceCompress ? ' (Manual trigger)' : ''}${service ? '' : ' (Local mode)'}`);
 
     // 深拷贝消息
     const allMessages = JSON.parse(JSON.stringify(messages));
@@ -1620,20 +1715,25 @@ async function compressContextByWeight(messages, model, systemPrompt = null, too
     // 构建压缩后的消息数组
     const compressedMessages = [];
 
-    // 1. 添加低分消息摘要（如果有）
+    // 1. 添加低分消息的压缩上下文（如果有）
     if (lowScoreSummary) {
         compressedMessages.push({
             role: 'user',
             content: [{
                 type: 'text',
-                text: `[COMPRESSED CONTEXT SUMMARY]\n\n以下是之前对话中次要内容的摘要（中间推理过程和失败记录）：\n\n${lowScoreSummary}\n\n---\n[END OF SUMMARY]`
+                text: `<context_compression>
+以下是之前对话的压缩上下文。这些内容已被精简以节省 token，但包含了重要的历史信息。
+请在回复时参考这些上下文，理解之前的操作和状态。
+
+${lowScoreSummary}
+</context_compression>`
             }]
         });
         compressedMessages.push({
             role: 'assistant',
             content: [{
                 type: 'text',
-                text: '我已了解之前的上下文摘要，将继续处理。'
+                text: '我已理解压缩的上下文信息，将基于这些历史记录继续处理当前任务。'
             }]
         });
     }
